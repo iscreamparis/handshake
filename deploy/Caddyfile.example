@@ -1,0 +1,5 @@
+# Caddy terminates TLS automatically. WebSocket upgrades (/ws) pass through
+# reverse_proxy without extra configuration; /health is proxied too.
+rooms.example.com {
+	reverse_proxy 127.0.0.1:8787
+}

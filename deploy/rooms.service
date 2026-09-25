@@ -1,0 +1,19 @@
+[Unit]
+Description=Kart rooms server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rooms
+WorkingDirectory=/opt/kart-rooms
+EnvironmentFile=/etc/kart-rooms.env
+ExecStart=/usr/bin/node --experimental-strip-types src/main.ts
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
