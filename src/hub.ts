@@ -2,7 +2,7 @@
 // No network code here; all time comes from deps.now() or tick(nowMs).
 
 import type { Config } from './config.ts'
-import type { ClientMessage, ErrorCode, LocalPlayer, Member, Rid, RoomSettings, ServerMessage } from './protocol.ts'
+import type { ClientMessage, ErrorCode, LocalPlayer, Member, Rid, RoomListing, RoomSettings, ServerMessage } from './protocol.ts'
 import { DEFAULT_SETTINGS, MAX_HUMANS, MAX_MACHINES, PROTOCOL_VERSION, encode, parseClientMessage } from './protocol.ts'
 import { generateRoomCode, normalizeRoomCode } from './codes.ts'
 import { TokenBucket } from './ratelimit.ts'
@@ -39,6 +39,7 @@ interface Room {
   members: Map<number, Client>
   lastActivity: number
   seed: number
+  private: boolean
 }
 
 export class RoomHub {
@@ -144,7 +145,8 @@ export class RoomHub {
     }
     switch (m.t) {
       case 'hello': return this.error(c, 'bad_message', 'hello already received', m.rid)
-      case 'create': return this.onCreate(c, m.players, m.settings, m.rid, now)
+      case 'create': return this.onCreate(c, m.players, m.settings, m.private === true, m.rid, now)
+      case 'list': return this.onList(c, m.rid)
       case 'join': return this.onJoin(c, m.code, m.players, m.rid, now)
       case 'leave': {
         if (!c.room) return this.error(c, 'not_in_room', 'not in a room', m.rid)
@@ -209,13 +211,13 @@ export class RoomHub {
     }
   }
 
-  private onCreate(c: Client, players: LocalPlayer[], settings: RoomSettings | undefined, r: Rid | undefined, now: number): void {
+  private onCreate(c: Client, players: LocalPlayer[], settings: RoomSettings | undefined, isPrivate: boolean, r: Rid | undefined, now: number): void {
     if (c.room) return this.error(c, 'already_in_room', 'already in a room', r)
     if (this.rooms.size >= this.cfg.maxRooms) return this.error(c, 'server_full', 'no room available on this server', r)
     const code = generateRoomCode(this.deps.random, (k) => this.rooms.has(k))
     const room: Room = {
       code, game: c.game, owner: 0, status: 'lobby', settings: { ...(settings ?? DEFAULT_SETTINGS) },
-      members: new Map(), lastActivity: now, seed: 0,
+      members: new Map(), lastActivity: now, seed: 0, private: isPrivate,
     }
     this.rooms.set(code, room)
     c.room = room
@@ -223,6 +225,19 @@ export class RoomHub {
     c.players = players
     room.members.set(0, c)
     this.send(c, this.roomMessage(room, c, r))
+  }
+
+  /** Public rooms still in the lobby, for the same game version as the caller, fullest first. */
+  private onList(c: Client, r: Rid | undefined): void {
+    const rooms: RoomListing[] = []
+    for (const room of this.rooms.values()) {
+      if (room.private || room.status !== 'lobby' || room.game !== c.game) continue
+      if (room.members.size >= MAX_MACHINES || humans(room) >= MAX_HUMANS) continue
+      const owner = room.members.get(room.owner)
+      rooms.push({ code: room.code, owner: owner ? owner.name : '', humans: humans(room), settings: { ...room.settings } })
+    }
+    rooms.sort((a, b) => b.humans - a.humans || a.code.localeCompare(b.code))
+    this.send(c, { t: 'rooms', ...rid(r), rooms: rooms.slice(0, 50) })
   }
 
   private onJoin(c: Client, rawCode: string, players: LocalPlayer[], r: Rid | undefined, now: number): void {
@@ -273,6 +288,7 @@ export class RoomHub {
     return {
       t: 'room', ...rid(r), code: room.code, you: target.peer, owner: room.owner, status: room.status,
       members: memberList(room), settings: { ...room.settings }, humans: humans(room),
+      ...(room.private ? { private: true } : {}),
     }
   }
 

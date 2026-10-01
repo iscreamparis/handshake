@@ -19,7 +19,8 @@ Written once here. rooms/PROTOCOL.md is its word-for-word copy. rooms/src/protoc
 
 ## Client to server
 - `hello` { v: 1, game: string (1..64: the client's build id), name: string (1..16) }. Must be the first message. Reply: `welcome`.
-- `create` { players: LocalPlayer[] (1..4), settings?: RoomSettings }. Reply: `room`. The creator is the owner, with peer 0.
+- `create` { players: LocalPlayer[] (1..4), settings?: RoomSettings, private?: boolean }. Reply: `room`. The creator is the owner, with peer 0. A private room is never listed: it is joined by code only.
+- `list` {}. Reply: `rooms`. Public rooms in the lobby with the same `game` as the caller, not full.
 - `join` { code: string, players: LocalPlayer[] }. Reply: `room`, and `room` is broadcast to the others.
 - `leave` {}. Reply: `left`, and `room` is broadcast to the others.
 - `players` { players: LocalPlayer[] }. Lobby only. Broadcasts `room`.
@@ -34,8 +35,9 @@ Written once here. rooms/PROTOCOL.md is its word-for-word copy. rooms/src/protoc
 
 ## Server to client
 - `welcome` { v: 1, client: string (an opaque session id), iceServers: IceServer[], maxHumans: 8, maxLocal: 4 }.
-- `room` { rid?, code: string, you: number, owner: number, status: 'lobby' | 'racing', members: Member[] (sorted by peer), settings: RoomSettings, humans: number }.
+- `room` { rid?, code: string, you: number, owner: number, status: 'lobby' | 'racing', members: Member[] (sorted by peer), settings: RoomSettings, humans: number, private?: true }.
 - `started` { code, seed: number, settings: RoomSettings, members: Member[] }. The frozen roster of the race or cup.
+- `rooms` { rid?, rooms: RoomListing[] (max 50, fullest first) }. RoomListing = { code, owner: string (the owner's name), humans: number, settings: RoomSettings }.
 - `left` {}.
 - `peerLeft` { peer }. Always followed by a `room` message.
 - `signal` { from: number, data: SignalData }.

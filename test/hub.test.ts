@@ -354,3 +354,38 @@ test('an exception in a handler is logged and answered with internal', () => {
   assert.deepEqual(b.conn.last(), { t: 'error', rid: 5, code: 'internal', message: b.conn.last().message })
   assert.ok(s.logs.some((l) => l.startsWith('error ') && l.includes('boom')))
 })
+
+test('list shows public lobby rooms of the same game, never private, full or racing ones', () => {
+  const s = setup()
+  const pub = createRoom(s, 1)
+  const priv = s.hello()
+  priv.send({ t: 'create', players: players(1), private: true })
+  const pr = priv.conn.take()[0]
+  assert.equal(pr.private, true)
+  const other = createRoom(s, 1, 'kart-2')
+  const viewer = s.hello()
+  viewer.send({ t: 'list', rid: 9 })
+  const r = viewer.conn.last()
+  assert.equal(r.t, 'rooms')
+  assert.equal(r.rid, 9)
+  assert.deepEqual(r.rooms.map((x: Msg) => x.code), [pub.code])
+  assert.equal(r.rooms[0].owner, 'Ann')
+  assert.equal(r.rooms[0].humans, 1)
+  // a private room is still joinable by code
+  viewer.send({ t: 'join', code: pr.code, players: players(1) })
+  assert.equal(viewer.conn.last().t, 'room')
+  assert.equal(viewer.conn.last().private, true)
+  // racing rooms drop out of the list
+  pub.owner.send({ t: 'start' })
+  const v2 = s.hello()
+  v2.send({ t: 'list' })
+  assert.deepEqual(v2.conn.last().rooms, [])
+  void other
+})
+
+test('create.private must be a boolean', () => {
+  const s = setup()
+  const a = s.hello()
+  a.send({ t: 'create', players: players(1), private: 'yes' })
+  assert.equal(a.conn.last().code, 'bad_message')
+})

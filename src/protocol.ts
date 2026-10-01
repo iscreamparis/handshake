@@ -25,6 +25,7 @@ export interface KartBuildIds { characterId: string; bodyId: string; wheelId: st
 export interface LocalPlayer { name: string; build: KartBuildIds }
 export interface RoomSettings { kind: 'cup' | 'track'; cupId: string; trackId: string; cc: 50 | 100 | 150 | 200; items: boolean }
 export interface Member { peer: number; name: string; players: LocalPlayer[] }
+export interface RoomListing { code: string; owner: string; humans: number; settings: RoomSettings }
 export interface IceServer { urls: string[]; username?: string; credential?: string }
 export type SignalData =
   | { kind: 'offer' | 'answer'; sdp: string }
@@ -35,8 +36,9 @@ export type Rid = string | number
 
 export type ClientMessage =
   | { t: 'hello'; rid?: Rid; v: number; game: string; name: string }
-  | { t: 'create'; rid?: Rid; players: LocalPlayer[]; settings?: RoomSettings }
+  | { t: 'create'; rid?: Rid; players: LocalPlayer[]; settings?: RoomSettings; private?: boolean }
   | { t: 'join'; rid?: Rid; code: string; players: LocalPlayer[] }
+  | { t: 'list'; rid?: Rid }
   | { t: 'leave'; rid?: Rid }
   | { t: 'players'; rid?: Rid; players: LocalPlayer[] }
   | { t: 'settings'; rid?: Rid; settings: RoomSettings }
@@ -47,8 +49,9 @@ export type ClientMessage =
 
 export type ServerMessage =
   | { t: 'welcome'; rid?: Rid; v: 1; client: string; iceServers: IceServer[]; maxHumans: 8; maxLocal: 4 }
-  | { t: 'room'; rid?: Rid; code: string; you: number; owner: number; status: 'lobby' | 'racing'; members: Member[]; settings: RoomSettings; humans: number }
+  | { t: 'room'; rid?: Rid; code: string; you: number; owner: number; status: 'lobby' | 'racing'; members: Member[]; settings: RoomSettings; humans: number; private?: boolean }
   | { t: 'started'; rid?: Rid; code: string; seed: number; settings: RoomSettings; members: Member[] }
+  | { t: 'rooms'; rid?: Rid; rooms: RoomListing[] }
   | { t: 'left'; rid?: Rid }
   | { t: 'peerLeft'; peer: number }
   | { t: 'signal'; from: number; data: SignalData }
@@ -152,10 +155,12 @@ export function parseClientMessage(raw: string): ClientMessage | ParseError {
         if (o.players === undefined) return bad('create.players missing')
         const players = validatePlayers(o.players)
         if (!players) return fail('bad_players', 'invalid players list', rid)
-        if (o.settings === undefined) return withRid({ t: 'create', players })
+        if (o.private !== undefined && typeof o.private !== 'boolean') return bad('create.private must be a boolean')
+        const priv = o.private === true ? { private: true } : {}
+        if (o.settings === undefined) return withRid({ t: 'create', players, ...priv })
         const settings = validateSettings(o.settings)
         if (!settings) return fail('bad_settings', 'invalid settings', rid)
-        return withRid({ t: 'create', players, settings })
+        return withRid({ t: 'create', players, settings, ...priv })
       }
       case 'join': {
         if (typeof o.code !== 'string') return bad('join.code must be a string')
@@ -176,7 +181,7 @@ export function parseClientMessage(raw: string): ClientMessage | ParseError {
         if (!settings) return fail('bad_settings', 'invalid settings', rid)
         return withRid({ t: 'settings', settings })
       }
-      case 'leave': case 'start': case 'end':
+      case 'list': case 'leave': case 'start': case 'end':
         return withRid({ t: o.t })
       case 'signal': {
         const to = o.to
