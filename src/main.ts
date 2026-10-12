@@ -1,18 +1,20 @@
 // Entry point: load config from the environment, start the server, close gracefully on signals.
 
 import { loadConfig } from './config.ts'
-import { startServer } from './server.ts'
+import { createHandshake } from './handshake.ts'
+import { createMemoryStore } from './store/memory.ts'
 
 async function main(): Promise<void> {
   const cfg = loadConfig(process.env)
-  const srv = await startServer(cfg)
-  console.log(`rooms listening on ${cfg.host}:${srv.port}`)
+  const hs = createHandshake({ config: cfg, store: createMemoryStore() })
+  const { port } = await hs.listen()
+  console.log(`rooms listening on ${cfg.host}:${port}`)
   let stopping = false
   const stop = async (): Promise<void> => {
     if (stopping) return
     stopping = true
     try {
-      await srv.close()
+      await hs.close()
     } catch (e) {
       console.error(e)
     }
