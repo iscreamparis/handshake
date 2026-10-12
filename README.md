@@ -1,4 +1,6 @@
-# rooms
+# Handshake
+
+Handshake is an embeddable Node game-server module (npm package `kart-rooms`, with a typed `dist/`) and also the standalone KartRacer rooms server.
 
 The kart game's rooms server. It keeps rooms (5-char codes, up to 8 machines and
 8 human players), the lobby state (members, their local players, the room
@@ -10,6 +12,54 @@ It NEVER relays race data: once the lobby starts, race traffic flows peer to
 peer over WebRTC DataChannels.
 
 The wire protocol is described in [PROTOCOL.md](PROTOCOL.md).
+
+## Embedding
+
+```ts
+import { createHandshake, createMemoryStore, guestIdentity } from 'kart-rooms'
+
+const handshake = createHandshake({
+  config: { port: 8787, host: '127.0.0.1' },
+  store: createMemoryStore(),
+  hooks: {
+    verifyIdentity: async (provider, token, name) =>
+      provider === 'guest' ? guestIdentity(token, name) : null,
+    pickResident: async () => null,
+    onMatchEnd: (record) => console.log(`match ${record.match_id}: ${record.status}`),
+  },
+})
+
+await handshake.listen()
+process.once('SIGTERM', () => {
+  handshake.close().then(() => process.exit(0))
+})
+```
+
+The `store` must implement the Promise-based `PlayerStore`: every method returns a Promise and the caller awaits it. A database implementation can therefore replace `createMemoryStore()` without other changes.
+
+- `verifyIdentity` turns a provider token into a verified identity, or returns `null` to refuse the player. The example delegates guest tokens to `guestIdentity`.
+- `pickResident` supplies a resident opponent for a waiting ranked or quick player, or returns `null` to decline.
+- `onMatchEnd` receives the `MatchRecord` of every finished match.
+
+The relay and matchmaking hooks are wired by later milestones: in this version the hooks are stored on the instance but not yet called.
+
+## Store contract suite
+
+The contract suite checks a `PlayerStore` implementation. It is exported from the `kart-rooms/contract` subpath, never from the main entry. Run it with `node:test`:
+
+```ts
+import { playerStoreContract } from 'kart-rooms/contract'
+import { createMemoryStore } from 'kart-rooms'
+
+playerStoreContract('memory store', () => createMemoryStore())
+```
+
+## Build
+
+- `npm run build` compiles `src/` with `tsc` into `dist/`, emitting JavaScript and `.d.ts` files.
+- `npm run typecheck` runs the strict type check without emitting files.
+
+Both need the dev dependencies, so run `npm install` first. A server that only runs the module can use `npm install --omit=dev`: `npm start` still runs from source and needs no build.
 
 ## Requirements
 
