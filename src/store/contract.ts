@@ -21,7 +21,7 @@ async function play(store: PlayerStore, a: string, b: string, score: 0 | 0.5 | 1
 
 export function playerStoreContract(label: string, makeStore: StoreFactory): void {
   describe(label, () => {
-    const promiseCases: Array<[string, (store: PlayerStore) => Promise<unknown>, StoreError['code']]> = [
+    const promiseCases: Array<[string, (store: PlayerStore) => Promise<unknown>, StoreError['code'] | 'none' | 'resolve']> = [
       ['getOrCreateByIdentity', s => s.getOrCreateByIdentity({ provider: 'guest', external_id: '' }), 'bad_argument'],
       ['getPlayer', s => s.getPlayer('unknown'), 'none'],
       ['getRating', s => s.getRating('unknown', 'game'), 'not_found'],
