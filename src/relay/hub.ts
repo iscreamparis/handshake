@@ -1,4 +1,4 @@
-// Transport-agnostic GameNet relay. Reconnection is added in the next port step.
+// Transport-agnostic GameNet relay with tick-driven reconnection deadlines.
 import type { ClientConn } from '../hub.ts'
 import type { RelayClientMessage, RelayMessage, RelayMatched } from './protocol.ts'
 import {
@@ -122,15 +122,20 @@ export class RelayHub {
   disconnect(conn: string): void {
     const c = this.clients.get(conn)
     if (!c) return
-    const seat = this.findSeat(conn)
+    const seat = this.seatOf(conn)
     this.clients.delete(conn)
     this.cleanup(c)
     this.ext?.connClosed(conn, seat)
   }
 
   tick(nowMs: number): void {
-    // Disconnects end seats immediately in this step. The next step arms
-    // per-seat deadlines in Session.down and checks them here.
+    for (const [code, room] of [...this.sessions]) {
+      for (let side = 0; side < room.players; side++) {
+        const deadline = room.down[side]
+        if (deadline !== null && nowMs >= deadline) this.endSeat(code, room, side)
+        if (!this.sessions.has(code)) break
+      }
+    }
     this.ext?.tick(nowMs)
   }
 
@@ -150,16 +155,32 @@ export class RelayHub {
     this.send(conn, { t: 'error', reason: code })
   }
 
-  pairInto(_a: string, _b: string, _opts: { holdMs: number }): [RelaySeatRef, RelaySeatRef] {
-    throw new Error('not implemented')
+  pairInto(a: string, b: string, opts: { holdMs: number }): [RelaySeatRef, RelaySeatRef] {
+    if (a === b || !this.clients.has(a) || !this.clients.has(b)) throw new Error('invalid relay pair')
+    if (this.seatOf(a) || this.seatOf(b)) throw new Error('relay client already seated')
+    if (!Number.isFinite(opts.holdMs) || opts.holdMs < 0) throw new Error('invalid relay hold')
+    if (this.sessions.size >= MAX_ROOMS) throw new Error('server full')
+    this.dropFromWaitLists(a)
+    this.dropFromWaitLists(b)
+    const code = this.pairQuick([
+      { conn: a, payload: null, since: this.deps.now() },
+      { conn: b, payload: null, since: this.deps.now() },
+    ], false, opts.holdMs)
+    return [{ session: code, seat: 0, conn: a }, { session: code, seat: 1, conn: b }]
   }
 
-  endSession(_session: string, _reason: string): void {
-    throw new Error('not implemented')
+  endSession(session: string, _reason: string): void {
+    const room = this.sessions.get(session)
+    if (!room) return
+    this.broadcast(room, { t: 'opp_left' }, -1)
+    this.destroyRoom(session, room)
   }
 
-  seatOf(_conn: string): RelaySeatRef | null {
-    throw new Error('not implemented')
+  seatOf(conn: string): RelaySeatRef | null {
+    const code = this.clients.get(conn)?.roomCode
+    const room = code ? this.sessions.get(code) : undefined
+    const seat = room?.seats.indexOf(conn) ?? -1
+    return code && seat >= 0 ? { session: code, seat, conn } : null
   }
 
   private dispatch(c: Client, msg: RelayClientMessage, now: number): void {
@@ -209,8 +230,8 @@ export class RelayHub {
         return
       }
       case 'ping': return this.send(c.id, { t: 'pong' })
-      case 'resume': return this.sendError(c.id, 'resume expired', 'resume expired')
-      case 'bye': return this.cleanup(c)
+      case 'resume': return this.resume(c, msg, now)
+      case 'bye': return this.cleanup(c, true)
     }
   }
 
@@ -240,12 +261,19 @@ export class RelayHub {
       this.recentWaitsMs.push(now - e.since)
       if (this.recentWaitsMs.length > 50) this.recentWaitsMs.shift()
     }
+    this.pairQuick(seated, cadence, RESUME_GRACE_MS)
+  }
+
+  private pairQuick(seated: Waiter[], cadence: boolean, holdMs: number): string {
     const code = `q${++this.quickSeq}`
+    const players = seated.length
     const room = this.makeSession(players, cadence, { quick: true })
+    room.holdMs = holdMs
     room.seats = seated.map((e) => e.conn)
     room.payloads = seated.map((e) => e.payload)
     this.sessions.set(code, room)
     this.startRoom(code, room)
+    return code
   }
 
   private makeSession(players: number, cadence: boolean, opts: Session['opts']): Session {
@@ -280,6 +308,42 @@ export class RelayHub {
       if (room.players === 2) m.opp = room.payloads[s === 0 ? 1 : 0] as RelayMatched['opp']
       this.send(c.id, m)
     }
+  }
+
+  private resume(c: Client, msg: Extract<RelayClientMessage, { t: 'resume' }>, now: number): void {
+    const ref = this.resumeIndex.get(msg.token)
+    const room = ref ? this.sessions.get(ref.code) : undefined
+    if (!ref || !room) return this.sendError(c.id, 'resume expired', 'resume expired')
+    const side = ref.side
+    const deadline = room.down[side]
+    if (deadline !== null && now >= deadline) this.endSeat(ref.code, room, side)
+    if (room.gone[side]) return this.sendError(c.id, 'resume expired', 'resume expired')
+
+    const current = room.seats[side]
+    room.down[side] = null
+    // Rebind before closing the old connection so its cleanup cannot arm a
+    // deadline for the new occupant of this seat.
+    room.seats[side] = c.id
+    c.roomCode = ref.code
+    c.cadence = room.cadence
+    const old = current && current !== c.id ? this.clients.get(current) : undefined
+    if (old) {
+      old.roomCode = null
+      old.cadence = false
+      this.closeClient(old)
+    }
+
+    const have = new Array<number>(room.players).fill(0)
+    if (Array.isArray(msg.have)) {
+      for (let s = 0; s < room.players; s++) have[s] = msg.have[s] ?? 0
+    } else if (msg.have !== undefined) have.fill(msg.have)
+    this.send(c.id, { t: 'resumed', ack: room.recv[side] })
+    for (const e of room.log) {
+      if (e.side !== side && e.n > have[e.side]) this.send(c.id, { t: 'act', a: e.a, n: e.n, from: e.side })
+    }
+    if (room.players === 2) this.broadcast(room, { t: 'opp_back' }, side)
+    else this.broadcast(room, { t: 'player_back', seat: side }, side)
+    this.ext?.seatResumed({ session: ref.code, seat: side, conn: c.id })
   }
 
   private uuid(): string {
@@ -334,38 +398,46 @@ export class RelayHub {
     }
   }
 
-  private findSeat(conn: string): RelaySeatRef | null {
-    for (const [session, room] of this.sessions) {
-      const seat = room.seats.indexOf(conn)
-      if (seat >= 0) return { session, seat, conn }
-    }
-    return null
-  }
-
-  private cleanup(c: Client): void {
+  private cleanup(c: Client, graceful = false): void {
     this.dropFromWaitLists(c.id)
     for (const [code, room] of [...this.sessions]) {
       const side = room.seats.indexOf(c.id)
-      if (side < 0 || room.gone[side]) continue
-      room.gone[side] = true
-      room.down[side] = null
-      room.seats[side] = null
-      c.roomCode = null
-      c.cadence = false
-      if (room.players === 2) {
+      if (side < 0) continue
+      if (!graceful && room.tokens) {
+        if (room.down[side] !== null) continue
+        room.down[side] = this.deps.now() + room.holdMs
+        const msg = room.players === 2
+          ? { t: 'opp_dropped', graceMs: room.holdMs }
+          : { t: 'player_dropped', seat: side, graceMs: room.holdMs }
+        this.broadcast(room, msg, side)
+        continue
+      }
+      this.endSeat(code, room, side)
+    }
+  }
+
+  private endSeat(code: string, room: Session, side: number): void {
+    if (room.gone[side]) return
+    room.gone[side] = true
+    room.down[side] = null
+    const id = room.seats[side]
+    const c = id ? this.clients.get(id) : undefined
+    if (c) { c.roomCode = null; c.cadence = false }
+    room.seats[side] = null
+    if (room.players === 2) {
+      this.broadcast(room, { t: 'opp_left' }, side)
+      this.destroyRoom(code, room)
+    } else {
+      this.broadcast(room, { t: 'player_left', seat: side }, side)
+      if (room.gone.filter((gone) => !gone).length <= 1) {
         this.broadcast(room, { t: 'opp_left' }, side)
         this.destroyRoom(code, room)
-      } else {
-        this.broadcast(room, { t: 'player_left', seat: side }, side)
-        if (room.gone.filter((gone) => !gone).length <= 1) {
-          this.broadcast(room, { t: 'opp_left' }, side)
-          this.destroyRoom(code, room)
-        }
       }
     }
   }
 
   private destroyRoom(code: string, room: Session): void {
+    room.down.fill(null)
     if (room.tokens) for (const token of room.tokens) this.resumeIndex.delete(token)
     for (const id of room.seats) {
       const c = id ? this.clients.get(id) : undefined
