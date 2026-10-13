@@ -1,29 +1,7 @@
 // Scenario tests for the GameNet relay (RelayHub) over real sockets against
 // createHandshake, on RELAY_PATH. Ported from reference/pwaphaser-relay/relay.test.mjs
 // (the scenario list is docs/RELAY.md section 12); names are kept EXACTLY as the
-// reference. Part 1 covers connection, pairing, the legacy quick queue, action
-// relay, errors and close codes.
-//
-// Part 2 (next task) covers the reconnection, replay and timer scenarios, kept
-// out of this file on purpose:
-//   - jeton de reprise fourni à l'appariement
-//   - coupure brutale -> opp_dropped (partie en sursis)
-//   - coupure brutale -> PAS de opp_left immédiat
-//   - reprise acceptée (resumed + ack de mes actions reçues)
-//   - actions manquées rejouées au revenant
-//   - le pair est prévenu du retour (opp_back)
-//   - action renvoyée après reprise -> dédoublonnée
-//   - duel relayé normalement après reprise
-//   - reprise -> l'ancienne socket est TUÉE (plus de zombie)
-//   - action venue d'une socket zombie -> jamais relayée
-//   - le duel continue après la reprise
-//   - jeton inconnu -> « resume expired »
-//   - fenêtre de reprise expirée -> opp_left
-//   - coupure à 3 -> `player_dropped` avec le siège concerné
-//   - reprise à 3 acceptée
-//   - rejeu sélectif : seule l'action du siège NON couvert par `have` revient
-//   - rejeu sélectif : l'action déjà couverte n'est PAS rejouée
-//   - reprise à 3 : les autres sont prévenus (`player_back`)
+// reference. Covers all 51 scenarios, including reconnection, replay and timers.
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
@@ -63,7 +41,7 @@ after(async () => {
   server = null
 })
 
-// The tests drive the fake clock; part 1 needs no timer, part 2 will tick.
+// Protocol deadlines advance only through this clock and handshake.tick.
 function tick(ms: number): void {
   clock.t += ms
   server?.tick(clock.t)
@@ -462,4 +440,204 @@ test('salle cadencée : le plafond existe toujours (200 msg d\'un coup -> coupé
   for (let i = 1; i <= 200; i++) k1.send({ t: 'act', a: { k: 'i', v: i }, n: i })
   const err = await k1.next('error')
   assert.equal(err.reason, 'rate limited')
+})
+
+// Reproduce the reference duel's recv=[1,1], then miss seat 1's second action.
+// The socket exchange is awaited before ticking so the disconnect has armed
+// its deadline and the action has entered the replay log.
+async function resumeDuel() {
+  const [a, b, ma] = await pair()
+  a.send({ t: 'act', a: { k: 'move', x: 3, y: 7 }, n: 1 })
+  await b.next('act')
+  b.send({ t: 'act', a: { k: 'fire', target: 2 }, n: 1 })
+  await a.next('act')
+  a.ws.close()
+  const dropped = await b.next('opp_dropped')
+  await a.closed
+  tick(dropped.graceMs - 1)
+  b.send({ t: 'act', a: { k: 'end' }, n: 2 })
+  await b.wait((m) => m.t === 'ack' && m.n === 2)
+  const returning = await connect()
+  returning.send({ t: 'resume', token: ma.token, have: 1 })
+  const resumed = await returning.next('resumed')
+  const back = await b.next('opp_back')
+  return { a, b, returning, resumed, back }
+}
+
+test('jeton de reprise fourni à l\'appariement', { skip }, async () => {
+  const [, , ma, mb] = await pair()
+  assert.equal(typeof ma.token, 'string')
+  assert.equal(typeof mb.token, 'string')
+  assert.notEqual(ma.token, mb.token)
+})
+
+test('coupure brutale -> opp_dropped (partie en sursis)', { skip }, async () => {
+  const [a, b] = await pair()
+  a.ws.close()
+  const dropped = await b.next('opp_dropped')
+  assert.equal(dropped.t, 'opp_dropped')
+  assert.equal(dropped.graceMs, 60_000)
+})
+
+test('coupure brutale -> PAS de opp_left immédiat', { skip }, async () => {
+  const [a, b] = await pair()
+  a.ws.close()
+  const dropped = await b.next('opp_dropped')
+  tick(dropped.graceMs - 1)
+  assert.equal(await b.expectNone((m) => m.t === 'opp_left', 400), true)
+})
+
+test('reprise acceptée (resumed + ack de mes actions reçues)', { skip }, async () => {
+  const { resumed } = await resumeDuel()
+  assert.deepEqual(resumed, { t: 'resumed', ack: 1 })
+})
+
+test('actions manquées rejouées au revenant', { skip }, async () => {
+  const { returning } = await resumeDuel()
+  const replay = await returning.next('act')
+  assert.deepEqual(replay, { t: 'act', a: { k: 'end' }, n: 2, from: 1 })
+  // Pong follows all replay frames: inspect the complete replay without a delay.
+  returning.send({ t: 'ping' })
+  await returning.next('pong')
+  assert.deepEqual(returning.msgs.filter((m) => m.t === 'act'), [replay])
+  assert.equal(returning.msgs[0].t, 'resumed')
+})
+
+test('le pair est prévenu du retour (opp_back)', { skip }, async () => {
+  const { back } = await resumeDuel()
+  assert.deepEqual(back, { t: 'opp_back' })
+})
+
+test('action renvoyée après reprise -> dédoublonnée', { skip }, async () => {
+  const { b, returning } = await resumeDuel()
+  const mk = b.mark()
+  returning.send({ t: 'act', a: { k: 'move', x: 3, y: 7 }, n: 1 })
+  assert.equal((await returning.next('ack')).n, 1)
+  assert.equal(await b.expectNone((m) => m.t === 'act', 400, mk), true)
+})
+
+test('duel relayé normalement après reprise', { skip }, async () => {
+  const { b, returning } = await resumeDuel()
+  // Cross the original disconnect deadline after resuming: it must be canceled.
+  tick(1)
+  const mk = b.mark()
+  returning.send({ t: 'act', a: { k: 'end' }, n: 2 })
+  const act = await b.wait((m) => m.t === 'act', 1500, mk)
+  assert.deepEqual(act, { t: 'act', a: { k: 'end' }, n: 2, from: 0 })
+  assert.equal(b.msgs.some((m) => m.t === 'opp_left'), false)
+})
+
+// Resume while the old connection is still open, as in the half-open case.
+async function resumeLiveDuel() {
+  const [a, b, ma] = await pair()
+  a.send({ t: 'act', a: { k: 'end' }, n: 1 })
+  await b.next('act')
+  const returning = await connect()
+  returning.send({ t: 'resume', token: ma.token, have: 0 })
+  await returning.next('resumed')
+  return { a, b, returning }
+}
+
+test('reprise -> l\'ancienne socket est TUÉE (plus de zombie)', { skip }, async () => {
+  const { a } = await resumeLiveDuel()
+  await a.waitClose(2000)
+  await a.closed
+  assert.equal(a.ws.readyState, 3)
+})
+
+test('action venue d\'une socket zombie -> jamais relayée', { skip }, async () => {
+  const { a, b } = await resumeLiveDuel()
+  await a.waitClose(2000)
+  const mk = b.mark()
+  a.send({ t: 'act', a: { k: 'end' }, n: 2 })
+  assert.equal(await b.expectNone((m) => m.t === 'act', 500, mk), true)
+})
+
+test('le duel continue après la reprise', { skip }, async () => {
+  const { a, b, returning } = await resumeLiveDuel()
+  await a.waitClose(2000)
+  const mk = returning.mark()
+  b.send({ t: 'act', a: { k: 'end' }, n: 1 })
+  const act = await returning.wait((m) => m.t === 'act', 1500, mk)
+  assert.deepEqual(act, { t: 'act', a: { k: 'end' }, n: 1, from: 1 })
+})
+
+test('jeton inconnu -> « resume expired »', { skip }, async () => {
+  const c = await connect()
+  c.send({ t: 'resume', token: 'a'.repeat(36), have: 0 })
+  assert.deepEqual(await c.next('error'), { t: 'error', reason: 'resume expired' })
+})
+
+test('fenêtre de reprise expirée -> opp_left', { skip }, async () => {
+  const [a, b, ma] = await pair()
+  a.ws.close()
+  const dropped = await b.next('opp_dropped')
+  await a.closed
+  tick(dropped.graceMs - 1)
+  b.send({ t: 'ping' })
+  await b.next('pong')
+  assert.equal(b.msgs.some((m) => m.t === 'opp_left'), false)
+  tick(1)
+  assert.deepEqual(await b.next('opp_left'), { t: 'opp_left' })
+  const returning = await connect()
+  returning.send({ t: 'resume', token: ma.token, have: 0 })
+  assert.deepEqual(await returning.next('error'), { t: 'error', reason: 'resume expired' })
+})
+
+async function resumeTrio() {
+  const { p, m } = await pair3()
+  p[0].send({ t: 'act', a: { k: 'move', x: 1 }, n: 1 })
+  await Promise.all([p[1].next('act'), p[2].next('act')])
+  p[1].send({ t: 'act', a: { k: 'seat1' }, n: 1 })
+  await p[0].wait((msg) => msg.t === 'act' && msg.from === 1)
+  p[2].send({ t: 'act', a: { k: 'seat2' }, n: 1 })
+  await p[0].wait((msg) => msg.t === 'act' && msg.from === 2)
+  p[0].ws.close()
+  const dropped = await Promise.all([p[1].next('player_dropped'), p[2].next('player_dropped')])
+  await p[0].closed
+  tick(dropped[0].graceMs - 1)
+  const returning = await connect()
+  returning.send({ t: 'resume', token: m[0].token, have: [0, 1, 0] })
+  const resumed = await returning.next('resumed')
+  const back = await Promise.all([p[1].next('player_back'), p[2].next('player_back')])
+  return { p, returning, resumed, back }
+}
+
+test('coupure à 3 -> `player_dropped` avec le siège concerné', { skip }, async () => {
+  const { p } = await pair3()
+  p[0].ws.close()
+  const dropped = await Promise.all([p[1].next('player_dropped'), p[2].next('player_dropped')])
+  for (const msg of dropped) {
+    assert.deepEqual(msg, { t: 'player_dropped', seat: 0, graceMs: 60_000 })
+  }
+})
+
+test('reprise à 3 acceptée', { skip }, async () => {
+  const { resumed } = await resumeTrio()
+  assert.deepEqual(resumed, { t: 'resumed', ack: 1 })
+})
+
+test('rejeu sélectif : seule l\'action du siège NON couvert par `have` revient', { skip }, async () => {
+  const { returning } = await resumeTrio()
+  const replay = await returning.next('act')
+  assert.deepEqual(replay, { t: 'act', a: { k: 'seat2' }, n: 1, from: 2 })
+  returning.send({ t: 'ping' })
+  await returning.next('pong')
+  assert.deepEqual(returning.msgs.filter((msg) => msg.t === 'act'), [replay])
+  assert.equal(returning.msgs[0].t, 'resumed')
+})
+
+test('rejeu sélectif : l\'action déjà couverte n\'est PAS rejouée', { skip }, async () => {
+  const { returning } = await resumeTrio()
+  assert.equal(await returning.expectNone((msg) => msg.t === 'act' && msg.a.k === 'seat1', 400), true)
+})
+
+test('reprise à 3 : les autres sont prévenus (`player_back`)', { skip }, async () => {
+  const { p, returning, back } = await resumeTrio()
+  for (const msg of back) assert.deepEqual(msg, { t: 'player_back', seat: 0 })
+  tick(1)
+  returning.send({ t: 'act', a: { k: 'encore' }, n: 2 })
+  const acts = await Promise.all(p.slice(1).map((c) => c.wait((msg) => msg.t === 'act' && msg.n === 2)))
+  for (const msg of acts) assert.equal(msg.from, 0)
+  for (const c of p.slice(1)) assert.equal(c.msgs.some((msg) => msg.t === 'player_left'), false)
 })
