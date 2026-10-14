@@ -1,0 +1,23 @@
+[Unit]
+Description=Etcito publisher (Wavedash push/publish for the games)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=etcito
+Group=etcito
+WorkingDirectory=/opt/etcito-publisher
+EnvironmentFile=/etc/etcito-publisher.env
+ExecStart=/usr/bin/node --experimental-strip-types src/publisher/main.ts
+Restart=on-failure
+# The VM is small (0.9 GB shared with the CRM tenants): a runaway upload must not take it down.
+MemoryMax=300M
+Nice=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/etcito-publisher
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
