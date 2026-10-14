@@ -22,6 +22,7 @@ chmod 700 "$DATA/home"
 if [ ! -x "$DATA/home/.cargo/bin/wavedash" ]; then
   tmp="$(mktemp)"
   curl -fsSL https://wavedash.com/cli/install.sh -o "$tmp"
+  chmod 644 "$tmp"
   su -s /bin/sh etcito -c "HOME=$DATA/home WAVEDASH_NO_MODIFY_PATH=1 sh $tmp" || { rm -f "$tmp"; exit 1; }
   rm -f "$tmp"
 fi
