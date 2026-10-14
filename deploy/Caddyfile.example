@@ -1,5 +1,10 @@
-# Caddy terminates TLS automatically. WebSocket upgrades (/ws) pass through
-# reverse_proxy without extra configuration; /health is proxied too.
+# Caddy terminates TLS automatically and passes the Upgrade/Connection headers
+# through reverse_proxy on its own.
+#
+# The GameNet relay uses RELAY_PATH (src/relay/protocol.ts, '/ws' today, shared
+# with KartRacer). If RELAY_PATH ever differs, add that path to @ws.
 rooms.example.com {
-	reverse_proxy 127.0.0.1:8787
+	@ws path /ws
+	reverse_proxy @ws 127.0.0.1:8787
+	reverse_proxy /health 127.0.0.1:8787
 }
