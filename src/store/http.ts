@@ -62,8 +62,8 @@ export function createHttpPlayerStore(api: TableApi, opts: { now?: () => number;
       display_name: row.display_name as string,
       kind: row.kind as Player['kind'],
       identities: ids.map(r => {
-        const [provider, ...rest] = String(r.ident_key).split('\u0000')
-        return { provider: provider as Player['identities'][number]['provider'], external_id: rest.join('\u0000') }
+        const [provider, ...rest] = String(r.ident_key).split('\u001f')
+        return { provider: provider as Player['identities'][number]['provider'], external_id: rest.join('\u001f') }
       }),
       active_ranked_match: lock ? (lock.match_id as string) : null,
       created_at: row.created_at as number,
@@ -128,7 +128,7 @@ export function createHttpPlayerStore(api: TableApi, opts: { now?: () => number;
       stringArgument(identity.external_id, 'external id', 256)
       const kind = init?.kind ?? 'human'
       if (kind !== 'human' && kind !== 'resident') throw new StoreError('bad_argument', 'Invalid player kind')
-      const identKey = `${identity.provider}\u0000${identity.external_id}`
+      const identKey = `${identity.provider}\u001f${identity.external_id}`
       return locked([`i:${identKey}`], async () => {
         let created = false
         let ident = await one(T.ids, [{ field: 'ident_key', op: 'eq', value: identKey }])
@@ -193,7 +193,7 @@ export function createHttpPlayerStore(api: TableApi, opts: { now?: () => number;
         const claimed = await api.insert(T.results, { match_id, result_json: JSON.stringify(result) })
         if (claimed === 'conflict') return (await stored())!
         for (const c of [result.a, result.b]) {
-          await api.insert(T.events, { ev_key: `${match_id}\u0000${c.player_id}`, player_id: c.player_id, game, match_id, r_before: c.before, r_after: c.after, games: c.games })
+          await api.insert(T.events, { ev_key: `${match_id}\u001f${c.player_id}`, player_id: c.player_id, game, match_id, r_before: c.before, r_after: c.after, games: c.games })
         }
         for (const id of [a, b]) {
           const lock = await one(T.locks, [{ field: 'open_key', op: 'eq', value: id }])
