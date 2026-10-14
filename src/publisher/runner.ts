@@ -31,6 +31,7 @@ export interface Run {
   action: 'push' | 'publish'
   artifact: string | null
   build_id: string | null
+  request_id: number | null
   message: string
   status: RunStatus
   exit_code: number | null
@@ -75,7 +76,6 @@ export function createPublisher(cfg: PublisherConfig) {
   let chain: Promise<unknown> = Promise.resolve()
   const live = new Map<string, Run>()
   const rowIds = new Map<string, number>()
-  const requestIds = new Map<string, number | null>()
   let recordChain: Promise<unknown> = Promise.resolve()
 
   /** Mirror a run into the tenant. Serialised, never throws, never blocks a run: the tenant being down is not a deploy failure. */
@@ -89,7 +89,7 @@ export function createPublisher(cfg: PublisherConfig) {
         const id = rowIds.get(run.id)
         if (id === undefined) {
           const r = await recorder.insert('etc_deploy_runs', {
-            run_id: run.id, request_id: requestIds.get(run.id) ?? null, game: run.game, action: run.action,
+            run_id: run.id, request_id: run.request_id, game: run.game, action: run.action,
             artifact: run.artifact, message: run.message, started_at: run.started_at, ...patch,
           })
           if (r !== 'conflict') rowIds.set(run.id, r.row.id as number)
@@ -225,15 +225,21 @@ export function createPublisher(cfg: PublisherConfig) {
       buildId = req.build_id ?? null
       if (!buildId || !BUILD_ID_RE.test(buildId)) throw new PublisherError(400, 'a valid build_id is required to publish')
     }
+    // Idempotent per backoffice request: a workflow retry (or a double insert) must not start a second deploy.
+    const rid = Number(req.request_id)
+    const requestId = Number.isSafeInteger(rid) && rid > 0 ? rid : null
+    if (requestId !== null) {
+      const prior = [...live.values()].find(r => r.request_id === requestId)
+        ?? (await listRuns(1000)).find(r => r.request_id === requestId)
+      if (prior) return (await getRun(prior.id)) ?? (prior as Run)
+    }
     if ([...live.values()].some(r => r.game === req.game && (r.status === 'queued' || r.status === 'running'))) throw new PublisherError(409, 'a run is already in progress for this game')
     const run: Run = {
-      id: randomUUID(), game: req.game, action: req.action, artifact, build_id: buildId,
+      id: randomUUID(), game: req.game, action: req.action, artifact, build_id: buildId, request_id: requestId,
       message: clean(req.message, 200) || `${gameOf(req.game).name} ${new Date().toISOString().slice(0, 16)}Z`,
       status: 'queued', exit_code: null, started_at: Date.now(), ended_at: null, log: '',
     }
     live.set(run.id, run)
-    const rid = Number(req.request_id)
-    requestIds.set(run.id, Number.isSafeInteger(rid) && rid > 0 ? rid : null)
     await mkdir(dirs.runs, { recursive: true })
     await persist(run)
     record(run)
@@ -268,7 +274,7 @@ export function createPublisher(cfg: PublisherConfig) {
 
   /** Read-only: is the CLI logged in for this HOME? (same idea as nomorechat's claude_subscription_available) */
   async function authStatus(): Promise<{ authenticated: boolean; detail: string }> {
-    const probe: Run = { id: 'auth', game: '', action: 'push', artifact: null, build_id: null, message: '', status: 'running', exit_code: null, started_at: Date.now(), ended_at: null, log: '' }
+    const probe: Run = { id: 'auth', game: '', action: 'push', artifact: null, build_id: null, request_id: null, message: '', status: 'running', exit_code: null, started_at: Date.now(), ended_at: null, log: '' }
     const r = await exec(['auth', 'status'], cfg.dataDir, probe)
     const text = r.out.replace(/\u001b\[[0-9;]*m/g, '').trim()
     return { authenticated: r.code === 0 && /authenticated/i.test(text) && !/not authenticated/i.test(text), detail: text.slice(0, 300) }

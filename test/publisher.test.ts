@@ -140,6 +140,19 @@ describe('publisher', () => {
   })
 })
 
+describe('publisher idempotence', () => {
+  test('the same backoffice request id never starts a second deploy', async () => {
+    await api('/artifacts/kekkai', { method: 'PUT', body: await tarball({ 'index.html': 'again' }) })
+    const before = (await readFile(calls, 'utf8')).split(String.fromCharCode(10)).filter(l => l.includes('build push')).length
+    const a = await api('/runs', { method: 'POST', body: JSON.stringify({ game: 'kekkai', action: 'push', request_id: 7 }) })
+    await waitRun(a.json.id)
+    const b = await api('/runs', { method: 'POST', body: JSON.stringify({ game: 'kekkai', action: 'push', request_id: '7' }) })
+    assert.equal(b.json.id, a.json.id)
+    const after = (await readFile(calls, 'utf8')).split(String.fromCharCode(10)).filter(l => l.includes('build push')).length
+    assert.equal(after - before, 1)
+  })
+})
+
 describe('publisher -> tenant mirror', () => {
   test('every run is mirrored into etc_deploy_runs with its request id; a dead tenant never fails a run', async () => {
     const { createMemoryTableApi } = await import('../src/store/tables.ts')
