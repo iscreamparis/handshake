@@ -10,6 +10,8 @@ import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/p
 import { join } from 'node:path'
 import type { Readable } from 'node:stream'
 import type { TableApi } from '../store/tables.ts'
+import { achievementArgs, parseCreatedId, parseExisting, planCommands, portalJson, validateCatalog } from './catalog.ts'
+import type { Catalog } from './catalog.ts'
 
 export interface GameConfig { name: string; game_id: string }
 export interface PublisherConfig {
@@ -33,7 +35,7 @@ export interface Run {
   id: string
   game: string
   platform?: Platform
-  action: 'push' | 'publish'
+  action: 'push' | 'publish' | 'catalog'
   artifact: string | null
   build_id: string | null
   request_id: number | null
@@ -64,6 +66,26 @@ export interface RunRequest {
   summary?: string
   /** id of the etc_deploy_requests row that asked for this run (set by the backoffice workflow). */
   request_id?: number | string
+}
+export interface CatalogRequest {
+  game: string
+  game_id?: string
+  name?: string
+  publisher_id?: number | string
+  /** achievements + stats as the backoffice built them (see catalog.ts). */
+  catalog: unknown
+  /** Default TRUE: nothing is sent, the plan is returned. Only an explicit false executes (and then needs the token). */
+  dry_run?: boolean
+}
+export interface CatalogDryRun {
+  dry_run: true
+  game: string
+  game_id: string
+  counts: { achievements: number; stats: number }
+  /** The JSON of Developer Portal > Achievements > Import JSON. */
+  portal_json: { achievements: unknown[]; stats: unknown[] }
+  /** The wavedash CLI commands a real run would execute (the CLI has no import command). */
+  commands: string[][]
 }
 export class PublisherError extends Error {
   readonly status: number
@@ -216,6 +238,80 @@ export function createPublisher(cfg: PublisherConfig) {
     }
   }
 
+  /** Runs the catalogue through the CLI: list what exists, create stats, create or update achievements. Warnings never fail the run, a failed command does. */
+  async function executeCatalog(run: Run, catalog: Catalog, game: GameConfig, env: Record<string, string>): Promise<void> {
+    const work = join(dirs.work, run.id)
+    await mkdir(work, { recursive: true })
+    const say = (m: string) => { run.log = clip(run.log + `\n[catalog] ${m}\n`) }
+    try {
+      await writeFile(join(work, 'wavedash.toml'), `game_id = "${game.game_id}"\n`)
+      const cfgArgs = ['-c', join(work, 'wavedash.toml')]
+      const cli = async (args: string[]) => exec([...args, ...cfgArgs], work, run, env)
+      const listed = await cli(['achievement', 'list', '--json'])
+      if (listed.code !== 0) { run.exit_code = listed.code; run.status = 'failed'; say('cannot list the existing achievements, nothing was changed'); return }
+      const existing = new Map(parseExisting(listed.out).map(a => [a.identifier, a.id]))
+      const statIds = new Map<string, string>()
+      let failed = 0
+      for (const s of catalog.stats) {
+        const r = await cli(['stat', 'create', '--identifier', s.identifier, '--name', s.display_name])
+        if (r.code === 0) {
+          const id = parseCreatedId(r.out)
+          if (id) statIds.set(s.identifier, id); else say(`stat ${s.identifier} created, its id could not be read from the output`)
+        } else if (/exist|already|duplicate|taken|unique/i.test(r.out)) {
+          say(`stat ${s.identifier} already exists (not updated: the CLI needs its numeric id)`)
+        } else { failed++; say(`stat ${s.identifier} failed`) }
+      }
+      for (const a of catalog.achievements) {
+        const statId = a.stat_requirement ? statIds.get(a.stat_requirement.stat) ?? null : null
+        if (a.stat_requirement && !statId) say(`achievement ${a.identifier}: id of stat ${a.stat_requirement.stat} unknown, sent WITHOUT its stat trigger (link it in the portal or use the import JSON)`)
+        const r = await cli(achievementArgs(a, existing.get(a.identifier) ?? null, statId))
+        if (r.code !== 0) { failed++; say(`achievement ${a.identifier} failed`) }
+      }
+      run.exit_code = failed === 0 ? 0 : 1
+      run.status = failed === 0 ? 'ok' : 'failed'
+    } finally {
+      await rm(work, { recursive: true, force: true }).catch(() => undefined)
+    }
+  }
+
+  /** Dry run by default (returns the plan, needs no token); only `dry_run: false` with a Wavedash token executes. */
+  async function startCatalog(req: CatalogRequest, token?: string): Promise<CatalogDryRun | Run> {
+    const game = resolveGame({ game: req.game, game_id: req.game_id, name: req.name, platform: 'wavedash' })
+    let catalog: Catalog
+    try { catalog = validateCatalog(req.catalog) } catch (e) { throw new PublisherError(400, (e as Error).message) }
+    if (req.dry_run !== false) {
+      return {
+        dry_run: true, game: req.game, game_id: game.game_id,
+        counts: { achievements: catalog.achievements.length, stats: catalog.stats.length },
+        portal_json: portalJson(catalog), commands: planCommands(catalog).map(a => ['wavedash', ...a]),
+      }
+    }
+    const env = tokenEnv(token)
+    if (!env.WAVEDASH_TOKEN) throw new PublisherError(409, 'Wavedash API key missing (Réglage wavedash_api_token)')
+    if ([...live.values()].some(r => r.game === req.game && (r.status === 'queued' || r.status === 'running'))) throw new PublisherError(409, 'a run is already in progress for this game')
+    const pid = req.publisher_id
+    const run: Run = {
+      id: randomUUID(), game: req.game, platform: 'wavedash', action: 'catalog', artifact: null, build_id: null, request_id: null,
+      publisher_id: typeof pid === 'number' && Number.isSafeInteger(pid) ? pid : typeof pid === 'string' && pid !== '' ? clean(pid, 64) : null,
+      message: `catalogue ${catalog.achievements.length} achievements, ${catalog.stats.length} stats`,
+      status: 'queued', exit_code: null, started_at: Date.now(), ended_at: null, log: '',
+    }
+    live.set(run.id, run)
+    await mkdir(dirs.runs, { recursive: true })
+    await persist(run)
+    record(run)
+    chain = chain.then(async () => {
+      run.status = 'running'
+      await persist(run)
+      record(run)
+      try { await executeCatalog(run, catalog, game, env) } catch (e) { run.status = 'failed'; run.log = clip(run.log + `\n[publisher] ${(e as Error).message}\n`) }
+      run.ended_at = Date.now()
+      await persist(run)
+      record(run)
+    })
+    return run
+  }
+
   async function prune(game: string): Promise<void> {
     const names = (await listArtifacts(game)).map(a => a.name)
     for (const old of names.slice(cfg.keepArtifacts)) await rm(join(dirs.artifacts, game, old), { force: true })
@@ -357,7 +453,7 @@ export function createPublisher(cfg: PublisherConfig) {
   return {
     itchStatus,
     games: () => Object.entries(cfg.games ?? {}).map(([id, g]) => ({ id, name: g.name })),
-    listArtifacts, saveArtifact, startRun, getRun, listRuns, authStatus,
+    listArtifacts, saveArtifact, startRun, startCatalog, getRun, listRuns, authStatus,
     /** Resolves when every queued run has finished (tests, graceful shutdown). */
     idle: () => chain.then(() => recordChain).then(() => undefined),
   }

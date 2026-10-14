@@ -15,12 +15,12 @@ function authorised(req: IncomingMessage, key: string): boolean {
   const want = Buffer.from(key)
   return given.length === want.length && timingSafeEqual(given, want)
 }
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+async function readJson(req: IncomingMessage, maxBytes = 8192): Promise<Record<string, unknown>> {
   let size = 0
   const chunks: Buffer[] = []
   for await (const c of req) {
     size += (c as Buffer).length
-    if (size > 8192) throw new PublisherError(413, 'body too large')
+    if (size > maxBytes) throw new PublisherError(413, 'body too large')
     chunks.push(c as Buffer)
   }
   try {
@@ -57,6 +57,16 @@ export function createPublisherServer(publisher: Publisher, opts: { key: string;
       if (opts.handshake && req.method === 'POST' && path === '/handshake/update') {
         const b = await readJson(req)
         return send(res, 202, await opts.handshake.start(b.repo, b.ref))
+      }
+
+      if (req.method === 'POST' && path === '/wavedash/catalog') {
+        const b = await readJson(req, 262144)
+        const out = await publisher.startCatalog({
+          game: str(b.game) ?? '', game_id: str(b.game_id), name: str(b.name),
+          publisher_id: typeof b.publisher_id === 'number' || typeof b.publisher_id === 'string' ? b.publisher_id : undefined,
+          catalog: b.catalog, dry_run: b.dry_run === false ? false : true,
+        }, wavedashToken(req))
+        return send(res, 'dry_run' in out ? 200 : 202, out)
       }
 
       let m = /^\/runs\/([0-9a-f-]{36})$/.exec(path)
