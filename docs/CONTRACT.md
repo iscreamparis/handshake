@@ -1,4 +1,4 @@
-# Etcito online contract (r3)
+# Etcito online contract (r4)
 
 The shared rules of the Etcito game server, Handshake, the AI residents and every game client (first: Kekkai).
 One authority: this file. A change = a new revision number + one changelog line at the bottom. Written in English.
@@ -42,7 +42,7 @@ One authority: this file. A change = a new revision number + one changelog line 
 - Story card rewards are granted as unopened packs.
 - `open_pack` is a server action: the server rolls the cards (the client never decides drops) and records them.
 - Real money buys coins only, never cards directly. Minimum bundle: 2 EUR = 250 coins (payment fees). Larger bundles are degressive (defaults, backoffice settings): 5 EUR = 700, 10 EUR = 1500, 20 EUR = 3200.
-- Wavedash: the Wavedash purchase API; coins are credited only after the server verifies the purchase. itch.io: to be explored; fallback Stripe Checkout (web), same server crediting rule.
+- Wavedash: the Wavedash purchase API; coins are credited only after the server verifies the purchase. itch.io and the web: Stripe Checkout, same server crediting rule. Both are specified in section 8.
 
 ## 6. Protocol
 - JSON over WebSocket, the existing framing. New message types are additive: old KartRacer and Kekkai clients keep working.
@@ -50,7 +50,7 @@ One authority: this file. A change = a new revision number + one changelog line 
 
 ## 7. Messages
 
-Messages use the GameNet relay WebSocket at `/ws`, the same path as rooms. On the shared path, the first JSON text frame is routed by its `t`: relay types and the match types below go to the relay, while a rooms `hello` goes to rooms. Frames are JSON text objects with the type field `t`; errors use `{ t:'error', reason }`. A queue match pairs both players straight into a relay session on that same connection. The unchanged relay messages (`create`, `join`, `act`, `bye`, `queue`, `unqueue`, `resume`, `ping`) and their replies are documented in [docs/RELAY.md](RELAY.md). These additions are additive only: old KartRacer and GameNet clients keep working. Economy (wallet, packs) has no socket message in this revision; the host reaches it through the PlayerStore.
+Messages use the GameNet relay WebSocket at `/ws`, the same path as rooms. On the shared path, the first JSON text frame is routed by its `t`: relay types and the match types below go to the relay, while a rooms `hello` goes to rooms. Frames are JSON text objects with the type field `t`; errors use `{ t:'error', reason }`. A queue match pairs both players straight into a relay session on that same connection. The unchanged relay messages (`create`, `join`, `act`, `bye`, `queue`, `unqueue`, `resume`, `ping`) and their replies are documented in [docs/RELAY.md](RELAY.md). These additions are additive only: old KartRacer and GameNet clients keep working. The economy (coins, packs, collection, purchases) has its own messages, section 8.
 
 ### Client to server
 - `auth` { provider: `wavedash` | `itch` | `guest`, token: string (guest: 16..128 chars of [A-Za-z0-9_-]; wavedash/itch: 1..4096 chars), name?: string (3..16 chars after trim; used only when the player is created), game?: string (1..64 chars; the game, i.e. the mission whose player list is used) }. No auth required. Replies `authed` or error `already_authed`, `auth_failed`, `auth_unavailable`, `bad_message` (also: unknown `game`, or no `game` while several games are served), `store_unavailable` (or relay `internal`).
@@ -96,7 +96,48 @@ Messages use the GameNet relay WebSocket at `/ws`, the same path as rooms. On th
 - Forfeit: a seat not resumed with its token within 90000 ms loses; both seats absent means void. The relay session then ends.
 - Every match end calls `hooks.onMatchEnd`.
 
+## 8. Economy (r4)
+
+One economy per game (= per mission, never shared between games). Everything below needs `auth`; an unauthenticated
+connection gets `auth_required`. The server is the only authority: the client never sends an amount, a price or a card.
+
+### State (tables of the mission)
+`etc_wallets` (coins, version), `etc_packs` (closed packs per player and `pack_type`), `etc_cards` (collection: quantity per player and card),
+`etc_products` (catalogue edited in the backoffice), `etc_purchases` (one row per purchase: `provider` `wavedash` | `stripe` | `coins`,
+`external_id` unique per provider, `status` `pending` | `granted` | `refunded`), `etc_ledger` (journal and idempotency guard, unique `tx_id`).
+The card pool, the pack rules (size, tiers, weights, guaranteed last slot, duplicate refund) and the rewards are DATA: the JSON text of
+`etc_settings` key `economy.catalog` (`{cards:[{id,rarity,token?}], packs:{<pack_type>:{kind:"random"|"fixed",...}}, rewards:{<id or prefix*>:{coins?,packs?}}}`).
+Prices and what a purchase contains are the rows of `etc_products` (`price` in minor units, or coins for provider `coins`; `grant_coins`, `grant_packs` `{"<pack_type>": n}`).
+
+### Idempotency
+Every mutation is committed by ONE ledger row with a unique `tx_id`. Client operations carry an `op` (1..64 chars of `A-Za-z0-9_:.-`) chosen by the
+client; the server namespaces it by player. The same `op` with the same parameters answers the original result with `applied: false`
+and changes nothing; the same `op` with other parameters is `tx_conflict`. A reward is granted once per player and `reward_id`.
+Purchases are keyed by the provider's id (`purchaseId`, Checkout session id). A replay, a duplicated webhook or a concurrent delivery grants once.
+
+### Client to server
+- `eco_get` { op? }. Replies `eco_state`.
+- `eco_products` { op? }. Replies `eco_products` { products: [{provider, code, label, description, price, currency, grant_coins, grant_packs}] } (active products of every provider; the client keeps the ones of its platform).
+- `eco_reward` { reward_id }. Grants the reward defined in the catalog (amount decided by the server). Replies `eco_reward` { reward_id, granted: {coins, packs}, coins, applied }. Error `unknown_reward`.
+- `eco_buy` { op, product, qty? (1..100) }. Buys a `coins` product with coins. Replies `eco_bought` { product, qty, coins, packs, applied }. Errors `unknown_product`, `insufficient_funds`, `tx_conflict`.
+- `eco_open` { op, pack_type }. The SERVER draws the cards (or reveals a fixed pack), records them in the collection and refunds the duplicates as the pack definition says. Replies `eco_opened` { pack_type, cards: [{id, rarity, is_new, duplicate}], refund, coins, remaining, applied }. Errors `unknown_pack`, `no_packs`, `tx_conflict`.
+- `eco_wavedash` { op?, receipt_jwt, user_jwt? }. The Wavedash `PURCHASE_COMPLETED` receipt (and `getUserJwt()`). The server verifies the receipt (RS256 against the Wavedash JWKS, cached; `typ` `wavedash-purchase+jwt`; `iss`; `aud` one of the game's Wavedash ids = the enabled `wavedash` rows of `etc_publishers`; `env` `PRODUCTION` unless `etc_settings` `economy.allow_playtest` is `1`; `ptype` `CONSUMABLE`), that its `sub` is an identity of the authenticated player (and equals the user JWT `sub`, same `gcid`), then credits the product whose `code` is the receipt's `contentIdentifier`. Replies `eco_purchase` { provider, external_id, product, status:"granted", coins, granted, applied }. Only after this reply may the client call `Wavedash.fulfillPurchase(purchaseId)`. Errors `bad_receipt`, `not_production`, `receipt_mismatch`, `unknown_product`, `purchase_refunded`, `economy_unavailable`.
+- `eco_stripe` { op?, product, return_url }. Opens a Stripe Checkout for an active `stripe` product. Replies `eco_checkout` { url, session_id }: the client opens `url` in the browser. Coins arrive only when Stripe confirms the payment (webhook); the player's open connections receive an `eco_state` push, or the client asks `eco_get` when the player comes back. Errors `unknown_product`, `bad_return_url`, `payment_unavailable`, `economy_unavailable`.
+
+### Server to client
+- `eco_state` { op?, coins, version, packs: [{pack_type, quantity}], cards: {<card id>: quantity} }. Also pushed when a webhook purchase or refund changes the player's economy.
+- Errors: `{ t:'error', reason, op? }` (the `op` of the request is echoed when it had one). New reasons: `economy_unavailable`, `insufficient_funds`, `no_packs`, `tx_conflict`, `unknown_product`, `unknown_reward`, `unknown_pack`, `purchase_refunded`, `bad_receipt`, `receipt_mismatch`, `not_production`, `bad_return_url`, `payment_unavailable`.
+
+### Webhooks (HTTP, no session; nothing is trusted before it is verified)
+- `POST /webhooks/wavedash` body `{receiptJwt}`: the receipt is verified as above (the game is found from the receipt audience), the buyer is the player of the identity `wavedash` / `sub` (created if new), the product is credited, then the server calls `POST https://api.wavedash.com/api/purchases/{purchaseId}/fulfill`. `purchase.refunded` takes back the coins and the still-closed packs of that purchase (opened cards are kept), and a refund seen before its purchase blocks the purchase. 2xx only when handled; a product missing from `etc_products` answers 409 and a failed fulfill 502, so Wavedash retries.
+- `POST /webhooks/stripe`: the raw body and `Stripe-Signature` are verified by the CRM bridge (the Stripe secrets are Reglages of the tenant, Handshake holds none). `checkout.session.completed` / `checkout.session.async_payment_succeeded` with `payment_status: paid` credit the product once (the session amount and currency must match the amount recorded at Checkout creation); `charge.refunded` (full) reverses it. Unknown or unconfirmed payments grant nothing.
+
+### Rules
+- A refund may take the coin balance below zero: spending is refused until it is positive again. Cards already revealed are never removed.
+- A profile (wallet, packs, collection) belongs to one game: the same Wavedash id in two games has two unrelated economies.
+
 ## Changelog
 - r1 (2026-10-12): first version.
 - r2 (2026-10-14): section 7 Messages written by the Handshake project.
 - r3 (2026-10-14): `auth` gains an optional `game` (one player list per game); `bad_message` for an unknown or mismatched game; `bad_queue` also for a queue the game does not offer. Additive.
+- r4 (2026-10-15): economy messages (`eco_*`), server-side pack opening from data, Wavedash consumable receipts and Stripe Checkout, payment webhooks, tables `etc_wallets` / `etc_cards` / `etc_packs` / `etc_products` / `etc_purchases`. Additive.

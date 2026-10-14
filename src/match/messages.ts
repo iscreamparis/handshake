@@ -2,13 +2,17 @@ import type { Outcome } from '../hooks.ts'
 import type { Provider, QueueName } from '../store/types.ts'
 import { RELAY_CLIENT_TYPES, RELAY_SERVER_TYPES, RELAY_TYPE_FIELD } from '../relay/protocol.ts'
 
-export const MATCH_CLIENT_TYPES = ['auth', 'match_queue', 'match_unqueue', 'result'] as const
-export const MATCH_SERVER_TYPES = ['authed', 'match_queued', 'match_unqueued', 'match', 'result_ack', 'match_end'] as const
+export const ECONOMY_CLIENT_TYPES = ['eco_get', 'eco_products', 'eco_reward', 'eco_buy', 'eco_open', 'eco_wavedash', 'eco_stripe'] as const
+export const ECONOMY_SERVER_TYPES = ['eco_state', 'eco_products', 'eco_reward', 'eco_bought', 'eco_opened', 'eco_purchase', 'eco_checkout'] as const
+export const MATCH_CLIENT_TYPES = ['auth', 'match_queue', 'match_unqueue', 'result', ...ECONOMY_CLIENT_TYPES] as const
+export const MATCH_SERVER_TYPES = ['authed', 'match_queued', 'match_unqueued', 'match', 'result_ack', 'match_end', ...ECONOMY_SERVER_TYPES] as const
 export const MATCH_ERROR_CODES = [
   'auth_required', 'already_authed', 'auth_failed', 'auth_unavailable',
   'already_queued', 'not_queued', 'in_match', 'ranked_busy',
   'resident_cannot_queue', 'bad_queue', 'unknown_match', 'already_reported',
   'store_unavailable',
+  'economy_unavailable', 'insufficient_funds', 'no_packs', 'tx_conflict', 'unknown_product', 'unknown_reward', 'unknown_pack',
+  'purchase_refunded', 'bad_receipt', 'receipt_mismatch', 'not_production', 'bad_return_url', 'payment_unavailable',
 ] as const
 
 const relayTypes: readonly string[] = [...RELAY_CLIENT_TYPES, ...RELAY_SERVER_TYPES]
@@ -25,6 +29,13 @@ export type MatchClientMessage =
   | { t: 'match_queue'; game: string; queue: QueueName }
   | { t: 'match_unqueue' }
   | { t: 'result'; match_id: string; outcome: Outcome }
+  | { t: 'eco_get'; op?: string }
+  | { t: 'eco_products'; op?: string }
+  | { t: 'eco_reward'; op?: string; reward_id: string }
+  | { t: 'eco_buy'; op: string; product: string; qty: number }
+  | { t: 'eco_open'; op: string; pack_type: string }
+  | { t: 'eco_wavedash'; op?: string; receipt_jwt: string; user_jwt?: string }
+  | { t: 'eco_stripe'; op?: string; product: string; return_url: string }
 
 export type MatchServerMessage =
   | { t: 'authed'; player_id: string; display_name: string; provider: Provider }
@@ -39,6 +50,11 @@ export type MatchServerMessage =
     t: 'match_end'; match_id: string; status: 'complete' | 'void' | 'forfeit'; outcome: Outcome | null
     rating?: { before: number; after: number; games: number; placement: boolean }
   }
+
+export type EconomyClientMessage = Extract<MatchClientMessage, { t: typeof ECONOMY_CLIENT_TYPES[number] }>
+export function isEconomyMessage(m: MatchClientMessage): m is EconomyClientMessage {
+  return (ECONOMY_CLIENT_TYPES as readonly string[]).includes(m.t)
+}
 
 export type MatchParseError = { error: 'bad_message'; message: string } | { error: 'bad_queue' }
 export type ParseMatchResult = MatchClientMessage | MatchParseError | null
@@ -99,6 +115,8 @@ export function parseMatchMessage(raw: string | Record<string, unknown>): ParseM
     }
     case 'match_unqueue':
       return { t: 'match_unqueue' }
+    case 'eco_get': case 'eco_products': case 'eco_reward': case 'eco_buy': case 'eco_open': case 'eco_wavedash': case 'eco_stripe':
+      return parseEconomy(type, value)
     case 'result': {
       const { match_id, outcome } = value
       if (typeof match_id !== 'string' || match_id.length < 1 || match_id.length > 128) {
@@ -108,6 +126,44 @@ export function parseMatchMessage(raw: string | Record<string, unknown>): ParseM
         return bad('result.outcome must be win, loss or draw')
       }
       return { t: 'result', match_id, outcome }
+    }
+  }
+}
+
+const ID = /^[A-Za-z0-9_:.-]{1,96}$/
+const str = (v: unknown, max: number): v is string => typeof v === 'string' && v.length >= 1 && v.length <= max
+
+function parseEconomy(type: typeof ECONOMY_CLIENT_TYPES[number], v: Record<string, unknown>): MatchClientMessage | MatchParseError {
+  const opField = v.op
+  if (opField !== undefined && !(typeof opField === 'string' && /^[A-Za-z0-9_:.-]{1,64}$/.test(opField))) return bad(`${type}.op must be 1..64 chars of A-Za-z0-9_:.-`)
+  const op = opField as string | undefined
+  const withOp = op === undefined ? {} : { op }
+  switch (type) {
+    case 'eco_get': return { t: 'eco_get', ...withOp }
+    case 'eco_products': return { t: 'eco_products', ...withOp }
+    case 'eco_reward':
+      if (!(typeof v.reward_id === 'string' && /^[A-Za-z0-9:_.-]{1,96}$/.test(v.reward_id))) return bad('eco_reward.reward_id invalid')
+      return { t: 'eco_reward', ...withOp, reward_id: v.reward_id }
+    case 'eco_buy': {
+      if (op === undefined) return bad('eco_buy.op required')
+      if (!(typeof v.product === 'string' && ID.test(v.product))) return bad('eco_buy.product invalid')
+      const qty = v.qty === undefined ? 1 : v.qty
+      if (typeof qty !== 'number' || !Number.isSafeInteger(qty) || qty < 1 || qty > 100) return bad('eco_buy.qty must be an integer 1..100')
+      return { t: 'eco_buy', op, product: v.product, qty }
+    }
+    case 'eco_open':
+      if (op === undefined) return bad('eco_open.op required')
+      if (!(typeof v.pack_type === 'string' && ID.test(v.pack_type))) return bad('eco_open.pack_type invalid')
+      return { t: 'eco_open', op, pack_type: v.pack_type }
+    case 'eco_wavedash': {
+      if (!str(v.receipt_jwt, 3000)) return bad('eco_wavedash.receipt_jwt must be 1..3000 chars')
+      if (v.user_jwt !== undefined && !str(v.user_jwt, 3000)) return bad('eco_wavedash.user_jwt must be 1..3000 chars')
+      return { t: 'eco_wavedash', ...withOp, receipt_jwt: v.receipt_jwt, ...(v.user_jwt !== undefined ? { user_jwt: v.user_jwt as string } : {}) }
+    }
+    case 'eco_stripe': {
+      if (!(typeof v.product === 'string' && ID.test(v.product))) return bad('eco_stripe.product invalid')
+      if (!str(v.return_url, 400)) return { error: 'bad_message', message: 'eco_stripe.return_url must be 1..400 chars' }
+      return { t: 'eco_stripe', ...withOp, product: v.product, return_url: v.return_url }
     }
   }
 }

@@ -6,12 +6,15 @@ import { createGameSettings, DEFAULT_GAME_PARAMS } from './gamesettings.ts'
 import type { GameSettings } from './gamesettings.ts'
 import type { TableApi } from './tables.ts'
 import type { PlayerStore, QueueName } from './types.ts'
+import type { EconomyService } from '../economy/service.ts'
 
 export interface GameBackend {
   /** Null for the legacy single shared store (any game name is accepted). */
   game: string | null
   store: PlayerStore
   queues(): readonly QueueName[]
+  /** The economy of the game (wallet, packs, cards, purchases); absent when none is configured. */
+  economy?: EconomyService
 }
 
 export interface GameRouter {
@@ -20,13 +23,15 @@ export interface GameRouter {
 }
 
 /** One store for every game name (memory store, tests, embedding): the behaviour before multi-game support. */
-export function singleStoreRouter(store: PlayerStore): GameRouter {
-  const backend: GameBackend = { game: null, store, queues: () => DEFAULT_GAME_PARAMS.queues }
+export function singleStoreRouter(store: PlayerStore, economy?: EconomyService): GameRouter {
+  const backend: GameBackend = { game: null, store, queues: () => DEFAULT_GAME_PARAMS.queues, ...(economy ? { economy } : {}) }
   return { resolve: () => backend }
 }
 
 export interface GameRouterHandle extends GameRouter {
   readonly games: string[]
+  /** Every game's backend (the HTTP webhooks look games up by receipt / event). */
+  backends(): GameBackend[]
   close(): void
 }
 
@@ -38,6 +43,8 @@ export async function createGameRouter(apis: Record<string, TableApi>, opts: {
   intervalMs?: number
   now?: () => number
   log?: (level: string, msg: string) => void
+  /** Builds the economy of a game from its table client and player store. */
+  economy?: (game: string, api: TableApi, store: PlayerStore) => EconomyService | undefined
 } = {}): Promise<GameRouterHandle> {
   const backends = new Map<string, GameBackend>()
   const settings: GameSettings[] = []
@@ -45,19 +52,19 @@ export async function createGameRouter(apis: Record<string, TableApi>, opts: {
     const s = createGameSettings(api, { game, intervalMs: opts.intervalMs, log: opts.log })
     if ((await s.refresh()) === 'mismatch') throw new Error(`[config] game "${game}": its service key reads a mission whose etc_game.handshake_game is another game`)
     settings.push(s)
-    backends.set(game, {
-      game,
-      store: createHttpPlayerStore(api, { now: opts.now, elo: () => s.current().elo }),
-      queues: () => s.current().queues,
-    })
+    const store = createHttpPlayerStore(api, { now: opts.now, elo: () => s.current().elo })
+    const economy = opts.economy?.(game, api, store)
+    backends.set(game, { game, store, queues: () => s.current().queues, ...(economy ? { economy } : {}) })
   }
   for (const s of settings) s.start()
+  for (const b of backends.values()) b.economy?.start()
   return {
     games: [...backends.keys()],
+    backends: () => [...backends.values()],
     resolve(game) {
       if (game === undefined) return backends.size === 1 ? [...backends.values()][0]! : null
       return backends.get(game) ?? null
     },
-    close() { for (const s of settings) s.stop() },
+    close() { for (const s of settings) s.stop(); for (const b of backends.values()) b.economy?.stop() },
   }
 }

@@ -34,12 +34,21 @@ export interface Endpoint {
   tick(nowMs: number): void
 }
 
+/** A plain HTTP endpoint (webhooks). The body is read as UTF-8 text, capped at `maxBytes`. */
+export interface HttpRoute {
+  method: 'POST'
+  path: string
+  maxBytes?: number
+  handle(req: { body: string; headers: IncomingMessage['headers'] }): Promise<{ status: number; body?: unknown }>
+}
+
 export interface TransportOptions {
   cfg: Config
   endpoints: Endpoint[]
   health(): unknown
   log(level: string, msg: string): void
   autoTick?: boolean
+  http?: HttpRoute[]
 }
 
 export interface Transport {
@@ -122,9 +131,43 @@ export async function startTransport(opts: TransportOptions): Promise<Transport>
       res.end(JSON.stringify(opts.health()))
       return
     }
+    const route = req.method === 'POST' ? opts.http?.find((r) => r.path === path) : undefined
+    if (route) {
+      void serveRoute(route, req, res)
+      return
+    }
     res.writeHead(404, { 'content-type': 'text/plain' })
     res.end('not found')
   })
+
+  async function serveRoute(route: HttpRoute, req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const max = route.maxBytes ?? 65536
+    const reply = (status: number, body: unknown): void => {
+      if (res.headersSent) return
+      res.writeHead(status, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(body ?? { ok: true }))
+    }
+    const chunks: Buffer[] = []
+    let size = 0
+    let done = false
+    const timer = setTimeout(() => { if (!done) { done = true; reply(408, { error: 'timeout' }); req.destroy() } }, 10000)
+    req.on('data', (c: Buffer) => {
+      if (done) return
+      size += c.length
+      if (size > max) { done = true; clearTimeout(timer); reply(413, { error: 'too large' }); req.destroy(); return }
+      chunks.push(c)
+    })
+    req.on('error', () => { done = true; clearTimeout(timer) })
+    req.on('end', () => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      route.handle({ body: Buffer.concat(chunks).toString('utf8'), headers: req.headers }).then(
+        (out) => reply(out.status, out.body),
+        (e: unknown) => { opts.log('error', `[http] ${route.path}: ${e instanceof Error ? e.message : String(e)}`); reply(500, { error: 'internal' }) },
+      )
+    })
+  }
 
   server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     const path = (req.url ?? '/').split('?')[0]

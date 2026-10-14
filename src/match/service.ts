@@ -11,7 +11,13 @@ import { resolveIdentity } from './auth.ts'
 import { Matchmaker } from './matchmaker.ts'
 import type { MatchPair, Waiter } from './matchmaker.ts'
 import { parseMatchMessage } from './messages.ts'
-import type { MatchClientMessage } from './messages.ts'
+import { isEconomyMessage } from './messages.ts'
+import type { EconomyClientMessage, MatchClientMessage } from './messages.ts'
+import { StoreError } from '../store/errors.ts'
+import { EconomyUnavailable } from '../economy/service.ts'
+import type { EconomyService } from '../economy/service.ts'
+import { WavedashError } from '../economy/wavedash.ts'
+import { StripeBridgeError } from '../economy/stripe.ts'
 
 export const FORFEIT_MS = 90000
 export const RESULT_WAIT_MS = 60000
@@ -68,6 +74,7 @@ export class MatchService implements RelayExtension {
   private pairing = new Set<string>()
   /** Waiter conns with a pickResident call (or its seat check) in flight. */
   private picking = new Set<string>()
+  private economies = new WeakSet<EconomyService>()
   private matches = new Map<string, ActiveMatch>()
   private bySession = new Map<string, ActiveMatch>()
   private byConn = new Map<string, ActiveMatch>()
@@ -148,12 +155,14 @@ export class MatchService implements RelayExtension {
     if ('error' in parsed) return this.error(conn, parsed.error)
     try {
       if (parsed.t === 'auth') await this.auth(conn, parsed)
+      else if (isEconomyMessage(parsed)) await this.economy(conn, parsed)
       else if (parsed.t === 'match_queue') await this.enqueue(conn, parsed.game, parsed.queue)
       else if (parsed.t === 'match_unqueue') {
         if (this.mm.remove(conn)) this.send(conn, { t: 'match_unqueued' })
         else this.error(conn, 'not_queued')
       } else await this.result(conn, parsed.match_id, parsed.outcome)
     } catch (err) {
+      if (isEconomyMessage(parsed)) return this.economyError(conn, parsed, err)
       if (err instanceof StoreFailure) {
         this.deps.log('error', `[match] store ${err.detail} on ${parsed.t} from ${conn}`)
         this.error(conn, 'store_unavailable')
@@ -173,7 +182,74 @@ export class MatchService implements RelayExtension {
     const { player } = await st(backend.store.getOrCreateByIdentity(res.identity, { display_name: res.display_name }))
     const me = { player_id: player.player_id, display_name: player.display_name, provider: m.provider, kind: player.kind, game: backend.game }
     this.authed.set(conn, me)
+    this.watchEconomy(backend.economy, backend.game)
     this.send(conn, { t: 'authed', player_id: me.player_id, display_name: me.display_name, provider: me.provider })
+  }
+
+  // --- economy (docs/CONTRACT.md r4 s8) -----------------------------------------------------------------------
+
+  /** Pushes `eco_state` to every connection of a player whose economy changed outside a request (webhook purchase). */
+  private watchEconomy(eco: EconomyService | undefined, game: string | null): void {
+    if (!eco || this.economies.has(eco)) return
+    this.economies.add(eco)
+    eco.onChange((playerId) => {
+      for (const [conn, me] of this.authed) {
+        if (me.player_id !== playerId || (me.game !== null && me.game !== game)) continue
+        void eco.state(playerId).then((s) => this.send(conn, { t: 'eco_state', ...s }), () => undefined)
+      }
+    })
+  }
+
+  private async economy(conn: string, m: EconomyClientMessage): Promise<void> {
+    const me = this.authed.get(conn)
+    if (!me) return this.error(conn, 'auth_required')
+    const backend = this.router.resolve(me.game ?? undefined)
+    const eco = backend?.economy
+    if (!eco) return this.error(conn, 'economy_unavailable')
+    const echo = 'op' in m && m.op !== undefined ? { op: m.op } : {}
+    const pid = me.player_id
+    switch (m.t) {
+      case 'eco_get': return this.send(conn, { t: 'eco_state', ...echo, ...(await eco.state(pid)) })
+      case 'eco_products': return this.send(conn, { t: 'eco_products', ...echo, products: await eco.products() })
+      case 'eco_reward': {
+        const r = await eco.reward(pid, m.reward_id)
+        return this.send(conn, { t: 'eco_reward', ...echo, reward_id: m.reward_id, granted: r.result.granted, coins: r.result.coins, applied: r.applied })
+      }
+      case 'eco_buy': {
+        const r = await eco.buy(pid, m.op, m.product, m.qty)
+        return this.send(conn, { t: 'eco_bought', ...echo, ...r.result, applied: r.applied })
+      }
+      case 'eco_open': {
+        const r = await eco.open(pid, m.op, m.pack_type)
+        return this.send(conn, { t: 'eco_opened', ...echo, ...r.result, applied: r.applied })
+      }
+      case 'eco_wavedash': {
+        const r = await eco.wavedashFromClient(pid, m.receipt_jwt, m.user_jwt)
+        return this.send(conn, { t: 'eco_purchase', ...echo, ...r })
+      }
+      case 'eco_stripe': {
+        if (!/^https?:\/\/[^\s]+$/.test(m.return_url)) return this.economyError(conn, m, new StoreError('bad_argument', 'bad_return_url'))
+        const s = await eco.stripeCheckout(pid, m.product, m.return_url)
+        return this.send(conn, { t: 'eco_checkout', ...echo, url: s.url, session_id: s.session_id })
+      }
+    }
+  }
+
+  private economyError(conn: string, m: { t: string; op?: string }, err: unknown): void {
+    let code = 'store_unavailable'
+    if (err instanceof StoreError) {
+      code = err.code === 'bad_argument' ? (err.message === 'bad_return_url' ? 'bad_return_url' : 'bad_message') : err.code === 'not_found' ? 'unknown_product' : err.code
+    } else if (err instanceof WavedashError) {
+      code = err.code === 'not_production' ? 'not_production' : err.code === 'receipt_mismatch' ? 'receipt_mismatch' : err.code === 'fulfill_failed' ? 'store_unavailable' : 'bad_receipt'
+    } else if (err instanceof EconomyUnavailable) {
+      code = 'economy_unavailable'
+    } else if (err instanceof StripeBridgeError) {
+      code = 'payment_unavailable'
+      this.deps.log('error', `[economy] ${m.t}: ${err.message}`)
+    } else {
+      this.deps.log('error', `[economy] ${m.t} from ${conn} failed`)
+    }
+    this.hub?.send(conn, { t: 'error', reason: code, ...(m.op !== undefined ? { op: m.op } : {}) })
   }
 
   private async enqueue(conn: string, game: string, queue: QueueName): Promise<void> {

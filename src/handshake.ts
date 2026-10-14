@@ -6,7 +6,7 @@ import { RoomHub } from './hub.ts'
 import type { HubDeps } from './hub.ts'
 import { defaultDeps, readVersion } from './server.ts'
 import { startTransport, roomsEndpoint } from './transport.ts'
-import type { Transport } from './transport.ts'
+import type { HttpRoute, Transport } from './transport.ts'
 import { RelayHub } from './relay/hub.ts'
 import { relayEndpoint } from './relay/endpoint.ts'
 import { MatchService } from './match/service.ts'
@@ -23,6 +23,8 @@ export interface HandshakeOptions {
   store?: PlayerStore | GameRouter
   hooks?: HandshakeHooks
   autoTick?: boolean
+  /** Extra plain HTTP routes (the payment webhooks, see economyRoutes). */
+  http?: HttpRoute[]
 }
 
 export interface Handshake {
@@ -72,6 +74,7 @@ export function createHandshake(options: HandshakeOptions = {}): Handshake {
           },
           log: deps.log,
           autoTick: options.autoTick ?? true,
+          http: options.http,
         })
       } catch (e) {
         listening = false

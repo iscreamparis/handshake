@@ -32,6 +32,11 @@ export const ETCITO_TABLES: Record<string, { columns: string[]; unique: string[]
   etc_game: { columns: ["code", "name", "repo_url", "repo_branch", "handshake_game", "elo_start", "elo_k_floor", "placement_games", "queues"], unique: [["code"]] },
   etc_publishers: { columns: ["platform", "label", "external_id", "enabled"], unique: [["platform", "external_id"]] },
   etc_settings: { columns: ["key", "value"], unique: [["key"]] },
+  etc_wallets: { columns: ["player_id", "coins", "version", "last_ledger_id", "updated_at"], unique: [["player_id"]] },
+  etc_cards: { columns: ["player_id", "card_id", "quantity", "ledger_id", "first_at", "updated_at"], unique: [["player_id", "card_id"]] },
+  etc_packs: { columns: ["player_id", "pack_type", "quantity", "ledger_id", "updated_at"], unique: [["player_id", "pack_type"]] },
+  etc_products: { columns: ["provider", "code", "label", "description", "price", "currency", "grant_coins", "grant_packs", "active", "sort_order", "created_at"], unique: [["provider", "code"]] },
+  etc_purchases: { columns: ["provider", "external_id", "player_id", "product_code", "status", "payment_ref", "amount", "currency", "payload", "created_at", "granted_at", "refunded_at"], unique: [["provider", "external_id"]] },
   etc_deploy_runs: { columns: ["run_id", "request_id", "game", "action", "artifact", "build_id", "status", "exit_code", "message", "started_at", "ended_at", "log"], unique: [["run_id"]] },
 }
 
