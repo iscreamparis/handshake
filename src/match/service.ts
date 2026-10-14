@@ -1,8 +1,8 @@
 // Matchmaking and identity on the relay socket, as a RelayExtension.
 import { randomUUID } from 'node:crypto'
-import type { HandshakeHooks, Outcome } from '../hooks.ts'
+import type { HandshakeHooks, MatchRecord, Outcome } from '../hooks.ts'
 import type { RelayExtension, RelayHub, RelaySeatRef } from '../relay/hub.ts'
-import type { PlayerKind, PlayerStore, Provider, QueueName } from '../store/types.ts'
+import type { PlayerKind, PlayerStore, Provider, QueueName, RatingChange } from '../store/types.ts'
 import { resolveIdentity } from './auth.ts'
 import { Matchmaker } from './matchmaker.ts'
 import type { MatchPair, Waiter } from './matchmaker.ts'
@@ -30,7 +30,13 @@ interface ActiveMatch {
   started_at: number
   firstReportAt: number | null
   down: [number | null, number | null]
+  /** Set once the end is decided; kept while a ranked rating cannot be applied yet. */
+  ending: { status: MatchRecord['status']; reason: MatchRecord['reason']; score_a: 0 | 0.5 | 1 | null } | null
+  busy: boolean
 }
+
+const SCORE: Record<Outcome, 0 | 0.5 | 1> = { win: 1, draw: 0.5, loss: 0 }
+const OUTCOME = (score: number): Outcome => score === 1 ? 'win' : score === 0 ? 'loss' : 'draw'
 
 /** Marks a rejected store Promise so the handler answers store_unavailable. */
 class StoreFailure extends Error {
@@ -76,7 +82,9 @@ export class MatchService implements RelayExtension {
     return true
   }
 
-  connClosed(conn: string, _seat: RelaySeatRef | null): void {
+  connClosed(conn: string, seat: RelaySeatRef | null): void {
+    const match = seat ? this.bySession.get(seat.session) : undefined
+    if (match && seat && (seat.seat === 0 || seat.seat === 1)) match.down[seat.seat] = this.deps.now() + FORFEIT_MS
     this.mm.remove(conn)
     this.authed.delete(conn)
     this.chains.delete(conn)
@@ -88,13 +96,27 @@ export class MatchService implements RelayExtension {
     this.authed.set(seat.conn, match.auth[seat.seat])
     this.byConn.delete(match.conns[seat.seat])
     match.conns[seat.seat] = seat.conn
+    match.down[seat.seat] = null
     this.byConn.set(seat.conn, match)
   }
 
-  sessionEnded(_session: string): void {}
+  sessionEnded(session: string): void {
+    const match = this.bySession.get(session)
+    if (!match || match.ending) return
+    if (this.checkForfeit(match)) return
+    if (match.firstReportAt === null) match.firstReportAt = this.deps.now()
+  }
 
   tick(nowMs: number): void {
     void this.runPairing(nowMs)
+    for (const match of [...this.matches.values()]) {
+      if (match.ending) {
+        if (!match.busy) this.end(match)
+      } else if (!this.checkForfeit(match) && match.firstReportAt !== null &&
+        match.firstReportAt + RESULT_WAIT_MS <= nowMs && match.reports.includes(null)) {
+        this.decide(match, 'void', 'no_report', null)
+      }
+    }
   }
 
   stats(): { queued: number; matches: number } {
@@ -114,10 +136,7 @@ export class MatchService implements RelayExtension {
       else if (parsed.t === 'match_unqueue') {
         if (this.mm.remove(conn)) this.send(conn, { t: 'match_unqueued' })
         else this.error(conn, 'not_queued')
-      } else if (this.byConn.get(conn)?.match_id !== parsed.match_id) {
-        // Result handling for an active match is added with the results rules.
-        this.error(conn, 'unknown_match')
-      }
+      } else await this.result(conn, parsed.match_id, parsed.outcome)
     } catch (err) {
       if (err instanceof StoreFailure) {
         this.deps.log('error', `[match] store ${err.detail} on ${parsed.t} from ${conn}`)
@@ -191,6 +210,8 @@ export class MatchService implements RelayExtension {
       started_at: this.deps.now(),
       firstReportAt: null,
       down: [null, null],
+      ending: null,
+      busy: false,
     }
     this.matches.set(matchId, match)
     this.bySession.set(match.session, match)
@@ -230,5 +251,92 @@ export class MatchService implements RelayExtension {
         this.deps.log('error', `[match] store unlock failed for ${matchId}`)
       })
     }
+  }
+
+  private async result(conn: string, matchId: string, outcome: Outcome): Promise<void> {
+    const match = this.matches.get(matchId)
+    const seat = match ? match.players.indexOf(this.authed.get(conn)?.player_id ?? '') : -1
+    if (!match || (seat !== 0 && seat !== 1)) return this.error(conn, 'unknown_match')
+    if (match.reports[seat] !== null) return this.error(conn, 'already_reported')
+    match.reports[seat] = outcome
+    match.firstReportAt ??= this.deps.now()
+    this.send(conn, { t: 'result_ack', match_id: matchId })
+    const [r0, r1] = match.reports
+    if (r0 === null || r1 === null || match.ending) return
+    if (SCORE[r0] + SCORE[r1] === 1) await this.decide(match, 'complete', 'agreed', SCORE[r0])
+    else await this.decide(match, 'void', 'disagreement', null)
+  }
+
+  /** Ends the match when a seat's forfeit deadline lapsed; true when it did. */
+  private checkForfeit(match: ActiveMatch): boolean {
+    const now = this.deps.now()
+    const lapsed = match.down.map((d) => d !== null && d <= now)
+    if (lapsed[0] && lapsed[1]) void this.decide(match, 'void', 'both_disconnected', null)
+    else if (lapsed[0] || lapsed[1]) void this.decide(match, 'forfeit', 'disconnect', lapsed[0] ? 0 : 1)
+    else return false
+    return true
+  }
+
+  private decide(match: ActiveMatch, status: MatchRecord['status'], reason: MatchRecord['reason'],
+    score_a: 0 | 0.5 | 1 | null): Promise<void> {
+    match.ending = { status, reason, score_a }
+    return this.end(match)
+  }
+
+  /** Applies or unlocks the ranked state, then notifies, ends the session and calls onMatchEnd. */
+  private async end(match: ActiveMatch): Promise<void> {
+    const { status, reason, score_a } = match.ending!
+    match.busy = true
+    let ratings: [RatingChange, RatingChange] | null = null
+    try {
+      if (match.queue === 'ranked' && score_a !== null) {
+        const res = await this.store.applyRankedResult({
+          match_id: match.match_id, game: match.game, a: match.players[0], b: match.players[1], score_a,
+        })
+        ratings = [res.a, res.b]
+      } else if (match.queue === 'ranked') {
+        for (const id of match.players) {
+          await this.store.unlockRanked(id, match.match_id).catch(() => {
+            this.deps.log('error', `[match] store unlock failed for ${match.match_id}`)
+          })
+        }
+      }
+    } catch (err) {
+      const code = (err as { code?: unknown } | null)?.code
+      this.deps.log('error', `[match] store ${typeof code === 'string' ? code : 'rejected'} applying ${match.match_id}`)
+      for (const c of match.conns) this.error(c, 'store_unavailable')
+      match.busy = false
+      return
+    }
+    this.drop(match)
+    match.conns.forEach((c, seat) => {
+      const score = score_a === null ? null : seat === 0 ? score_a : 1 - score_a
+      const r = ratings?.[seat]
+      this.send(c, {
+        t: 'match_end', match_id: match.match_id, status, outcome: score === null ? null : OUTCOME(score),
+        ...(r ? { rating: { before: r.before, after: r.after, games: r.games, placement: r.placement } } : {}),
+      })
+    })
+    if (status === 'forfeit' || reason === 'no_report' || reason === 'both_disconnected') {
+      this.hub?.endSession(match.session, reason)
+    }
+    this.deps.log('info', `[match] ${status} ${reason} ${match.match_id}`)
+    const record: MatchRecord = {
+      match_id: match.match_id, game: match.game, queue: match.queue,
+      players: [match.players[0], match.players[1]], residents: [match.residents[0], match.residents[1]],
+      status, reason, reports: [match.reports[0], match.reports[1]], score_a, ratings,
+      started_at: match.started_at, ended_at: this.deps.now(),
+    }
+    try {
+      await this.hooks.onMatchEnd?.(record)
+    } catch {
+      this.deps.log('error', `[match] onMatchEnd failed for ${match.match_id}`)
+    }
+  }
+
+  private drop(match: ActiveMatch): void {
+    this.matches.delete(match.match_id)
+    if (this.bySession.get(match.session) === match) this.bySession.delete(match.session)
+    for (const c of match.conns) if (this.byConn.get(c) === match) this.byConn.delete(c)
   }
 }
