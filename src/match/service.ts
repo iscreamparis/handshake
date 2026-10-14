@@ -1,6 +1,8 @@
 // Matchmaking and identity on the relay socket, as a RelayExtension.
 import { randomUUID } from 'node:crypto'
-import type { HandshakeHooks, MatchRecord, Outcome } from '../hooks.ts'
+import type { HandshakeHooks, MatchRecord, Outcome, ResidentSeat } from '../hooks.ts'
+import type { ClientConn } from '../hub.ts'
+import { RELAY_PATH } from '../relay/protocol.ts'
 import type { RelayExtension, RelayHub, RelaySeatRef } from '../relay/hub.ts'
 import type { PlayerKind, PlayerStore, Provider, QueueName, RatingChange } from '../store/types.ts'
 import { resolveIdentity } from './auth.ts'
@@ -61,6 +63,8 @@ export class MatchService implements RelayExtension {
   private authed = new Map<string, AuthedPlayer>()
   private chains = new Map<string, Promise<void>>()
   private pairing = new Set<string>()
+  /** Waiter conns with a pickResident call (or its seat check) in flight. */
+  private picking = new Set<string>()
   private matches = new Map<string, ActiveMatch>()
   private bySession = new Map<string, ActiveMatch>()
   private byConn = new Map<string, ActiveMatch>()
@@ -109,6 +113,7 @@ export class MatchService implements RelayExtension {
 
   tick(nowMs: number): void {
     void this.runPairing(nowMs)
+    this.runResidents(nowMs)
     for (const match of [...this.matches.values()]) {
       if (match.ending) {
         if (!match.busy) this.end(match)
@@ -181,20 +186,88 @@ export class MatchService implements RelayExtension {
     })))
   }
 
-  private async startMatch(pair: MatchPair): Promise<void> {
+  private runResidents(nowMs: number): void {
+    if (!this.hooks.pickResident) return
+    for (const w of this.mm.dueForResident(nowMs)) {
+      if (this.picking.has(w.conn)) continue
+      this.picking.add(w.conn)
+      void this.pickFor(w)
+    }
+  }
+
+  /** One pickResident call for a waiter; null or a throw is retried at the next tick. */
+  private async pickFor(w: Waiter): Promise<void> {
+    let seat: ResidentSeat | null = null
+    try {
+      seat = (await this.hooks.pickResident?.(w.game, w.queue, w.rating)) ?? null
+    } catch {
+      this.deps.log('error', `[match] pickResident failed for ${w.game}/${w.queue}`)
+    }
+    if (!seat) {
+      this.picking.delete(w.conn)
+      return
+    }
+    try {
+      await this.useResident(w, seat)
+    } catch {
+      this.deps.log('error', `[match] resident seat for ${w.conn} failed`)
+    } finally {
+      this.picking.delete(w.conn)
+    }
+  }
+
+  private async useResident(w: Waiter, seat: ResidentSeat): Promise<void> {
+    const hub = this.hub
+    if (!hub || this.mm.get(w.conn) !== w) return seat.release()
+    let player
+    try {
+      player = await this.store.getPlayer(seat.player_id)
+    } catch (err) {
+      seat.release()
+      this.deps.log('error', `[match] store ${new StoreFailure(err).detail} checking resident ${seat.player_id}`)
+      return this.error(w.conn, 'store_unavailable')
+    }
+    if (player?.kind !== 'resident') {
+      seat.release()
+      return this.deps.log('error', `[match] seat player ${seat.player_id} is not a resident`)
+    }
+    if (this.mm.get(w.conn) !== w) return seat.release()
+    const residentConn: ClientConn = { send: (text) => seat.sink.message(text), close: () => {} }
+    const rc = hub.connect(residentConn, RELAY_PATH)
+    if (!rc) return seat.release()
+    this.mm.remove(w.conn)
+    this.authed.set(rc, {
+      player_id: player.player_id, display_name: player.display_name,
+      provider: player.identities[0]?.provider ?? 'guest', kind: 'resident',
+    })
+    seat.socket.send = (frame) => hub.message(rc, frame)
+    const rw: Waiter = { conn: rc, player_id: player.player_id, game: w.game, queue: w.queue, rating: w.rating, since: this.deps.now() }
+    let started = false
+    try {
+      started = await this.startMatch({ game: w.game, queue: w.queue, a: w, b: rw }, [false, true])
+    } finally {
+      if (!started) {
+        seat.release()
+        hub.disconnect(rc)
+      }
+    }
+  }
+
+  /** Pairs two waiters into a relay session; true when the match started. */
+  private async startMatch(pair: MatchPair, residents: [boolean, boolean] = [false, false]): Promise<boolean> {
     const { a, b, game, queue } = pair
     const matchId = randomUUID()
     if (queue === 'ranked') {
       this.pairing.add(a.conn).add(b.conn)
       try {
-        if (!(await this.lockPair(a, b, matchId))) return
+        if (!(await this.lockPair(a, b, matchId, residents))) return false
       } finally {
         this.pairing.delete(a.conn)
         this.pairing.delete(b.conn)
       }
     }
     const authA = this.authed.get(a.conn), authB = this.authed.get(b.conn)
-    if (!this.hub || !authA || !authB) return
+    if (!this.hub || !authA || !authB) return false
     this.send(a.conn, { t: 'match', match_id: matchId, game, queue, seat: 0, opponent: { player_id: authB.player_id, display_name: authB.display_name } })
     this.send(b.conn, { t: 'match', match_id: matchId, game, queue, seat: 1, opponent: { player_id: authA.player_id, display_name: authA.display_name } })
     const [seatA, seatB] = this.hub.pairInto(a.conn, b.conn, { holdMs: FORFEIT_MS })
@@ -203,7 +276,7 @@ export class MatchService implements RelayExtension {
       players: [authA.player_id, authB.player_id],
       names: [authA.display_name, authB.display_name],
       auth: [authA, authB],
-      residents: [false, false],
+      residents: [residents[0], residents[1]],
       conns: [seatA.conn, seatB.conn],
       session: seatA.session,
       reports: [null, null],
@@ -217,29 +290,36 @@ export class MatchService implements RelayExtension {
     this.bySession.set(match.session, match)
     this.byConn.set(seatA.conn, match).set(seatB.conn, match)
     this.deps.log('info', `[match] start ${queue} ${game} ${matchId}`)
+    return true
   }
 
   /** Takes both ranked locks, or rolls back and answers; true when the match may start. */
-  private async lockPair(a: Waiter, b: Waiter, matchId: string): Promise<boolean> {
+  private async lockPair(a: Waiter, b: Waiter, matchId: string, residents: [boolean, boolean]): Promise<boolean> {
     const taken: Waiter[] = []
+    const isResident = (w: Waiter) => residents[w === a ? 0 : 1]
     let busy: Waiter | null = null
+    let current = a
     try {
       for (const w of [a, b]) {
+        current = w
         if (!(await st(this.store.lockRanked(w.player_id, matchId)))) { busy = w; break }
         taken.push(w)
       }
     } catch (err) {
       await this.unlock(taken, matchId)
       this.deps.log('error', `[match] store ${(err as StoreFailure).detail} locking ${matchId}`)
-      this.error(a.conn, 'store_unavailable')
-      this.error(b.conn, 'store_unavailable')
+      if (isResident(current)) {
+        for (const w of [a, b]) if (!isResident(w) && this.authed.has(w.conn)) this.mm.add(w)
+      } else {
+        for (const w of [a, b]) if (!isResident(w)) this.error(w.conn, 'store_unavailable')
+      }
       return false
     }
     const alive = [a, b].filter((w) => this.authed.has(w.conn))
     if (busy || alive.length < 2) {
       await this.unlock(taken, matchId)
-      if (busy) this.error(busy.conn, 'ranked_busy')
-      for (const w of alive) if (w !== busy) this.mm.add(w)
+      if (busy && !isResident(busy)) this.error(busy.conn, 'ranked_busy')
+      for (const w of alive) if (w !== busy && !isResident(w)) this.mm.add(w)
       return false
     }
     return true
@@ -320,6 +400,7 @@ export class MatchService implements RelayExtension {
     if (status === 'forfeit' || reason === 'no_report' || reason === 'both_disconnected') {
       this.hub?.endSession(match.session, reason)
     }
+    match.residents.forEach((r, seat) => { if (r) this.hub?.disconnect(match.conns[seat]) })
     this.deps.log('info', `[match] ${status} ${reason} ${match.match_id}`)
     const record: MatchRecord = {
       match_id: match.match_id, game: match.game, queue: match.queue,

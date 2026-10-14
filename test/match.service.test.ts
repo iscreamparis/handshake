@@ -4,7 +4,7 @@ import { RelayHub } from '../src/relay/hub.ts'
 import { MatchService } from '../src/match/service.ts'
 import { createMemoryStore } from '../src/store/memory.ts'
 import { guestIdentity } from '../src/hooks.ts'
-import type { HandshakeHooks, MatchRecord } from '../src/hooks.ts'
+import type { HandshakeHooks, MatchRecord, ResidentSeat } from '../src/hooks.ts'
 import type { PlayerStore } from '../src/store/types.ts'
 
 class FakeConn {
@@ -300,4 +300,103 @@ test('an onMatchEnd that throws is logged and does not break the service', async
   p.a.frame({ t: 'match_unqueue' })
   await flush()
   assert.deepEqual(p.a.conn.last(), { t: 'error', reason: 'not_queued' })
+})
+
+function residentSeat(player_id: string) {
+  const got: Record<string, unknown>[] = []
+  let released = 0
+  const seat: ResidentSeat = {
+    player_id,
+    socket: { send() {} },
+    sink: { message: (text) => { got.push(JSON.parse(text)) } },
+    release: () => { released++ },
+  }
+  return { seat, got, released: () => released }
+}
+
+async function residentSetup(kind: 'resident' | 'human', pick?: () => Promise<ResidentSeat | null>) {
+  const store = createMemoryStore()
+  const { player } = await store.getOrCreateByIdentity({ provider: 'itch', external_id: 'res-1' }, { kind, display_name: 'Resi' })
+  const r = residentSeat(player.player_id)
+  let calls = 0
+  const s = setup(store, { pickResident: async () => { calls++; return pick ? pick() : r.seat } })
+  const a = s.add()
+  a.frame(guest(1))
+  await flush()
+  a.frame({ t: 'match_queue', game: 'kekkai', queue: 'quick' })
+  await flush()
+  const step = async (ms: number) => { s.clock.t += ms; s.hub.tick(s.clock.t); await flush() }
+  return { s, a, r, step, calls: () => calls }
+}
+
+test('a quick waiter gets a resident at 8000 ms', async () => {
+  const { s, a, r, step, calls } = await residentSetup('resident')
+  await step(7999)
+  assert.equal(calls(), 0)
+  await step(1)
+  assert.equal(calls(), 1)
+  const types = a.conn.types()
+  assert.ok(types.indexOf('match') >= 0 && types.indexOf('match') < types.indexOf('matched'))
+  const m = a.conn.sent.find((x) => x.t === 'match')!
+  assert.equal(m.seat, 0)
+  assert.deepEqual(m.opponent, { player_id: r.seat.player_id, display_name: 'Resi' })
+  const rt = r.got.map((x) => x.t)
+  assert.ok(rt.indexOf('match') >= 0 && rt.indexOf('match') < rt.indexOf('matched'))
+  assert.equal(r.got.find((x) => x.t === 'match')!.seat, 1)
+  assert.equal(r.released(), 0)
+  assert.deepEqual(s.service.stats(), { queued: 0, matches: 1 })
+})
+
+test('a seat whose player is human is released with an error log', async () => {
+  const { s, r, step, calls } = await residentSetup('human')
+  await step(8000)
+  assert.equal(calls(), 1)
+  assert.equal(r.released(), 1)
+  assert.ok(s.logs.some((l) => l.startsWith('error [match] seat player')))
+  assert.deepEqual(s.service.stats(), { queued: 1, matches: 0 })
+})
+
+test('a waiter that unqueued before the hook resolved releases the seat', async () => {
+  let resolve!: (v: ResidentSeat | null) => void
+  const { s, a, r, step } = await residentSetup('resident', () => new Promise((res) => { resolve = res }))
+  await step(8000)
+  a.frame({ t: 'match_unqueue' })
+  await flush()
+  resolve(r.seat)
+  await flush()
+  assert.equal(r.released(), 1)
+  assert.deepEqual(s.service.stats(), { queued: 0, matches: 0 })
+  assert.equal(r.got.length, 0)
+})
+
+test('a null answer is retried at the next tick, one call in flight', async () => {
+  let resolve!: (v: ResidentSeat | null) => void
+  const { s, step, calls } = await residentSetup('resident', () => new Promise((res) => { resolve = res }))
+  await step(8000)
+  await step(1000)
+  await step(1000)
+  assert.equal(calls(), 1)
+  resolve(null)
+  await flush()
+  assert.equal(calls(), 1)
+  await step(1000)
+  assert.equal(calls(), 2)
+  assert.deepEqual(s.service.stats(), { queued: 1, matches: 0 })
+})
+
+test('host frames through seat.socket.send reach the human as a relay act', async () => {
+  const { s, a, r, step } = await residentSetup('resident')
+  await step(8000)
+  r.seat.socket.send(JSON.stringify({ t: 'act', a: { move: 3 } }))
+  await flush()
+  const act = a.conn.sent.find((x) => x.t === 'act')!
+  assert.deepEqual(act.a, { move: 3 })
+  assert.equal(act.from, 1)
+  const mid = matchOf({ conn: a.conn } as Side)
+  a.frame({ t: 'result', match_id: mid, outcome: 'win' })
+  r.seat.socket.send(JSON.stringify({ t: 'result', match_id: mid, outcome: 'loss' }))
+  await flush()
+  assert.equal(r.got.filter((x) => x.t === 'match_end').length, 1)
+  assert.deepEqual(s.service.stats(), { queued: 0, matches: 0 })
+  assert.equal(s.hub.stats().clients, 1)
 })
