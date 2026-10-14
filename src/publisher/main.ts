@@ -1,7 +1,8 @@
 // Publisher entry point. Env: PUBLISHER_KEY (required), PUBLISHER_PORT (9997), PUBLISHER_HOST (127.0.0.1),
 // PUBLISHER_DATA (/var/lib/etcito-publisher), PUBLISHER_HOME (= PUBLISHER_DATA/home, the CLI's credential home),
 // ETCITO_URL + ETCITO_API_KEY (optional: tenant API + gsk_ key, to mirror runs into etc_deploy_runs),
-// WAVEDASH_BIN (wavedash), PUBLISHER_GAMES (JSON path: {"kekkai":{"name":"Kekkai","game_id":"..."}}).
+// WAVEDASH_BIN (wavedash), PUBLISHER_GAMES (OPTIONAL JSON path: {"kekkai":{"name":"Kekkai","game_id":"..."}}; absent = fine,
+// the backoffice sends game + game_id with every run).
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createCrmTableApi } from '../store/tables.ts'
@@ -12,7 +13,10 @@ const env = process.env
 const dataDir = env.PUBLISHER_DATA ?? '/var/lib/etcito-publisher'
 const key = env.PUBLISHER_KEY ?? ''
 const gamesPath = env.PUBLISHER_GAMES ?? join(dataDir, 'games.json')
-const games = JSON.parse(readFileSync(gamesPath, 'utf8')) as Record<string, GameConfig>
+let games: Record<string, GameConfig> | undefined
+try { games = JSON.parse(readFileSync(gamesPath, 'utf8')) as Record<string, GameConfig> } catch (e) {
+  if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+}
 
 const publisher = createPublisher({
   dataDir, home: env.PUBLISHER_HOME ?? join(dataDir, 'home'), wavedashBin: env.WAVEDASH_BIN ?? 'wavedash', games,

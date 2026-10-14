@@ -17,7 +17,8 @@ export interface PublisherConfig {
   /** HOME of the service user: where the wavedash CLI keeps its own credentials. */
   home: string
   wavedashBin: string
-  games: Record<string, GameConfig>
+  /** Optional static table (compat): the normal path is a request that carries game + game_id. */
+  games?: Record<string, GameConfig>
   maxArtifactBytes: number
   keepArtifacts: number
   runTimeoutMs: number
@@ -32,6 +33,8 @@ export interface Run {
   artifact: string | null
   build_id: string | null
   request_id: number | null
+  /** Opaque id of the backoffice publisher row that asked for this run (echoed back, never interpreted). */
+  publisher_id: number | string | null
   message: string
   status: RunStatus
   exit_code: number | null
@@ -40,7 +43,13 @@ export interface Run {
   log: string
 }
 export interface RunRequest {
+  /** Slug, also the artifacts folder. */
   game: string
+  /** Wavedash game id; takes precedence over cfg.games[game]. */
+  game_id?: string
+  /** Display label (<= 80). */
+  name?: string
+  publisher_id?: number | string
   action: 'push' | 'publish'
   artifact?: string
   build_id?: string
@@ -55,7 +64,8 @@ export class PublisherError extends Error {
   constructor(status: number, message: string) { super(message); this.status = status; this.name = 'PublisherError' }
 }
 
-const GAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/
+const GAME_RE = /^[a-z0-9_-]{1,32}$/
+const GAME_ID_RE = /^[A-Za-z0-9]{8,64}$/
 const ARTIFACT_RE = /^[0-9]{13}-[0-9a-f]{8}\.tar\.gz$/
 const BUILD_ID_RE = /^[A-Za-z0-9_-]{6,64}$/
 const LOG_MAX = 64 * 1024
@@ -102,12 +112,29 @@ export function createPublisher(cfg: PublisherConfig) {
     })
   }
 
-  function gameOf(game: string): GameConfig {
-    const g = GAME_RE.test(game) ? cfg.games[game] : undefined
-    if (!g) throw new PublisherError(404, 'unknown game')
-    return g
+  function checkSlug(game: string): void {
+    if (typeof game !== 'string' || !GAME_RE.test(game)) throw new PublisherError(400, 'invalid game slug')
+  }
+  /** game_id from the request wins; otherwise the optional static table; otherwise 400. */
+  function resolveGame(req: { game: string; game_id?: string; name?: string }): GameConfig {
+    checkSlug(req.game)
+    const label = clean(req.name, 80)
+    if (req.game_id !== undefined && req.game_id !== '') {
+      if (!GAME_ID_RE.test(req.game_id)) throw new PublisherError(400, 'invalid game_id')
+      return { name: label || cfg.games?.[req.game]?.name || req.game, game_id: req.game_id }
+    }
+    const g = Object.hasOwn(cfg.games ?? {}, req.game) ? cfg.games![req.game] : undefined
+    if (!g) throw new PublisherError(400, 'unknown game')
+    return { name: label || g.name, game_id: g.game_id }
   }
   const persist = (run: Run) => writeFile(join(dirs.runs, `${run.id}.json`), JSON.stringify(run)).catch(() => undefined)
+
+  /** The Wavedash key arrives per request (the tenant's Réglages hold it): it reaches ONE child as WAVEDASH_TOKEN and is never stored or logged. */
+  function tokenEnv(token?: string): Record<string, string> {
+    if (token === undefined || token === '') return {}
+    if (!/^[!-~]{8,512}$/.test(token)) throw new PublisherError(400, 'invalid Wavedash token')
+    return { WAVEDASH_TOKEN: token }
+  }
 
   function exec(args: string[], cwd: string, run: Run, extraEnv: Record<string, string> = {}): Promise<{ code: number | null; out: string }> {
     return new Promise(resolve => {
@@ -133,8 +160,7 @@ export function createPublisher(cfg: PublisherConfig) {
     })
   }
 
-  async function execute(run: Run, req: RunRequest): Promise<void> {
-    const game = gameOf(run.game)
+  async function execute(run: Run, req: RunRequest, game: GameConfig, env: Record<string, string>): Promise<void> {
     const work = join(dirs.work, run.id)
     await mkdir(join(work, 'dist'), { recursive: true })
     try {
@@ -143,7 +169,7 @@ export function createPublisher(cfg: PublisherConfig) {
       if (run.action === 'push') {
         const code = await untar(join(dirs.artifacts, run.game, run.artifact!), join(work, 'dist'), run)
         if (code !== 0) { run.exit_code = code; run.status = 'failed'; return }
-        result = await exec(['build', 'push', '-c', join(work, 'wavedash.toml'), '-m', run.message], work, run)
+        result = await exec(['build', 'push', '-c', join(work, 'wavedash.toml'), '-m', run.message], work, run, env)
         run.build_id = parseBuildId(result.out)
         if (result.code === 0 && !run.build_id) run.log += '\n[publisher] pushed, but the build id could not be read from the output: use the id shown in the Wavedash developer portal for Publish.\n'
       } else {
@@ -151,7 +177,7 @@ export function createPublisher(cfg: PublisherConfig) {
         const title = clean(req.title, 120), summary = clean(req.summary, 500)
         if (title) args.push('--title', title)
         if (summary) args.push('--summary', summary)
-        result = await exec(args, work, run)
+        result = await exec(args, work, run, env)
       }
       run.exit_code = result.code
       run.status = result.code === 0 ? 'ok' : 'failed'
@@ -166,14 +192,14 @@ export function createPublisher(cfg: PublisherConfig) {
   }
 
   async function listArtifacts(game: string): Promise<{ name: string; bytes: number }[]> {
-    gameOf(game)
+    checkSlug(game)
     const dir = join(dirs.artifacts, game)
     const names = (await readdir(dir).catch(() => [] as string[])).filter(n => ARTIFACT_RE.test(n)).sort().reverse()
     return Promise.all(names.map(async name => ({ name, bytes: (await stat(join(dir, name))).size })))
   }
 
   async function saveArtifact(game: string, body: Readable): Promise<{ artifact: string; bytes: number; sha256: string }> {
-    gameOf(game)
+    checkSlug(game)
     const dir = join(dirs.artifacts, game)
     await mkdir(dir, { recursive: true })
     const artifact = `${Date.now()}-${randomUUID().slice(0, 8)}.tar.gz`
@@ -212,8 +238,9 @@ export function createPublisher(cfg: PublisherConfig) {
     return { artifact, bytes, sha256: hash.digest('hex') }
   }
 
-  async function startRun(req: RunRequest): Promise<Run> {
-    gameOf(req.game)
+  async function startRun(req: RunRequest, token?: string): Promise<Run> {
+    const env = tokenEnv(token)
+    const game = resolveGame(req)
     if (req.action !== 'push' && req.action !== 'publish') throw new PublisherError(400, 'action must be push or publish')
     let artifact: string | null = null
     let buildId: string | null = null
@@ -226,6 +253,8 @@ export function createPublisher(cfg: PublisherConfig) {
       if (!buildId || !BUILD_ID_RE.test(buildId)) throw new PublisherError(400, 'a valid build_id is required to publish')
     }
     // Idempotent per backoffice request: a workflow retry (or a double insert) must not start a second deploy.
+    const pid = req.publisher_id
+    const publisherId = typeof pid === 'number' && Number.isSafeInteger(pid) ? pid : typeof pid === 'string' && pid !== '' ? clean(pid, 64) : null
     const rid = Number(req.request_id)
     const requestId = Number.isSafeInteger(rid) && rid > 0 ? rid : null
     if (requestId !== null) {
@@ -236,7 +265,8 @@ export function createPublisher(cfg: PublisherConfig) {
     if ([...live.values()].some(r => r.game === req.game && (r.status === 'queued' || r.status === 'running'))) throw new PublisherError(409, 'a run is already in progress for this game')
     const run: Run = {
       id: randomUUID(), game: req.game, action: req.action, artifact, build_id: buildId, request_id: requestId,
-      message: clean(req.message, 200) || `${gameOf(req.game).name} ${new Date().toISOString().slice(0, 16)}Z`,
+      publisher_id: publisherId,
+      message: clean(req.message, 200) || `${game.name} ${new Date().toISOString().slice(0, 16)}Z`,
       status: 'queued', exit_code: null, started_at: Date.now(), ended_at: null, log: '',
     }
     live.set(run.id, run)
@@ -247,7 +277,7 @@ export function createPublisher(cfg: PublisherConfig) {
       run.status = 'running'
       await persist(run)
       record(run)
-      try { await execute(run, req) } catch (e) { run.status = 'failed'; run.log = clip(run.log + `\n[publisher] ${(e as Error).message}\n`) }
+      try { await execute(run, req, game, env) } catch (e) { run.status = 'failed'; run.log = clip(run.log + `\n[publisher] ${(e as Error).message}\n`) }
       run.ended_at = Date.now()
       await persist(run)
       record(run)
@@ -273,15 +303,15 @@ export function createPublisher(cfg: PublisherConfig) {
   }
 
   /** Read-only: is the CLI logged in for this HOME? (same idea as nomorechat's claude_subscription_available) */
-  async function authStatus(): Promise<{ authenticated: boolean; detail: string }> {
-    const probe: Run = { id: 'auth', game: '', action: 'push', artifact: null, build_id: null, request_id: null, message: '', status: 'running', exit_code: null, started_at: Date.now(), ended_at: null, log: '' }
-    const r = await exec(['auth', 'status'], cfg.dataDir, probe)
+  async function authStatus(token?: string): Promise<{ authenticated: boolean; detail: string }> {
+    const probe: Run = { id: 'auth', game: '', action: 'push', artifact: null, build_id: null, request_id: null, publisher_id: null, message: '', status: 'running', exit_code: null, started_at: Date.now(), ended_at: null, log: '' }
+    const r = await exec(['auth', 'status'], cfg.dataDir, probe, tokenEnv(token))
     const text = r.out.replace(/\u001b\[[0-9;]*m/g, '').trim()
     return { authenticated: r.code === 0 && /authenticated/i.test(text) && !/not authenticated/i.test(text), detail: text.slice(0, 300) }
   }
 
   return {
-    games: () => Object.entries(cfg.games).map(([id, g]) => ({ id, name: g.name })),
+    games: () => Object.entries(cfg.games ?? {}).map(([id, g]) => ({ id, name: g.name })),
     listArtifacts, saveArtifact, startRun, getRun, listRuns, authStatus,
     /** Resolves when every queued run has finished (tests, graceful shutdown). */
     idle: () => chain.then(() => recordChain).then(() => undefined),

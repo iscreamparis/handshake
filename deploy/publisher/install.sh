@@ -15,7 +15,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 id -u etcito >/dev/null 2>&1 || useradd --system --home-dir "$DATA/home" --shell /usr/sbin/nologin etcito
 mkdir -p "$DATA/home"
-[ -f "$DATA/games.json" ] || cp "$HERE/games.json" "$DATA/games.json"
+# games.json is optional (compat): games now come with each run from the backoffice mission. An existing one is kept.
 chown -R etcito:etcito "$DATA"
 chmod 700 "$DATA/home"
 

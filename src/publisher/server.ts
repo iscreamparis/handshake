@@ -28,6 +28,10 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
     return v as Record<string, unknown>
   } catch { throw new PublisherError(400, 'invalid JSON body') }
 }
+const wavedashToken = (req: IncomingMessage): string | undefined => {
+  const h = req.headers['x-wavedash-token']
+  return typeof h === 'string' && h !== '' ? h : undefined
+}
 const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined)
 
 export function createPublisherServer(publisher: Publisher, opts: { key: string }): Server {
@@ -40,7 +44,7 @@ export function createPublisherServer(publisher: Publisher, opts: { key: string 
       if (!authorised(req, opts.key)) return send(res, 401, { error: 'unauthorised' })
 
       if (req.method === 'GET' && path === '/games') return send(res, 200, { games: publisher.games() })
-      if (req.method === 'GET' && path === '/auth/status') return send(res, 200, await publisher.authStatus())
+      if (req.method === 'GET' && path === '/auth/status') return send(res, 200, await publisher.authStatus(wavedashToken(req)))
       if (req.method === 'GET' && path === '/runs') return send(res, 200, { runs: await publisher.listRuns() })
 
       let m = /^\/runs\/([0-9a-f-]{36})$/.exec(path)
@@ -51,11 +55,13 @@ export function createPublisherServer(publisher: Publisher, opts: { key: string 
       if (req.method === 'POST' && path === '/runs') {
         const b = await readJson(req)
         const body: RunRequest = {
-          game: str(b.game) ?? '', action: str(b.action) as RunRequest['action'], artifact: str(b.artifact), build_id: str(b.build_id),
+          game: str(b.game) ?? '', game_id: str(b.game_id), name: str(b.name),
+          publisher_id: typeof b.publisher_id === 'number' || typeof b.publisher_id === 'string' ? b.publisher_id : undefined,
+          action: str(b.action) as RunRequest['action'], artifact: str(b.artifact), build_id: str(b.build_id),
           message: str(b.message), title: str(b.title), summary: str(b.summary),
           request_id: typeof b.request_id === 'number' || typeof b.request_id === 'string' ? b.request_id : undefined,
         }
-        return send(res, 202, await publisher.startRun(body))
+        return send(res, 202, await publisher.startRun(body, wavedashToken(req)))
       }
       m = /^\/artifacts\/([a-z0-9_-]{1,32})$/.exec(path)
       if (m && req.method === 'GET') return send(res, 200, { artifacts: await publisher.listArtifacts(m[1]!) })

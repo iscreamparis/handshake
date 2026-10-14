@@ -113,7 +113,10 @@ describe('publisher', () => {
 
   test('push without an artifact, unknown games, one run per game at a time', async () => {
     assert.equal((await api('/runs', { method: 'POST', body: JSON.stringify({ game: 'kart', action: 'push' }) })).status, 404)
-    assert.equal((await api('/runs', { method: 'POST', body: JSON.stringify({ game: '../etc', action: 'push' }) })).status, 404)
+    assert.equal((await api('/runs', { method: 'POST', body: JSON.stringify({ game: '../etc', action: 'push' }) })).status, 400)
+    const unk = await api('/runs', { method: 'POST', body: JSON.stringify({ game: 'nope', action: 'push' }) })
+    assert.equal(unk.status, 400)
+    assert.equal(unk.json.error, 'unknown game')
     await api('/artifacts/kart', { method: 'PUT', body: await tarball({ 'index.html': 'x' }) })
     const [a, b] = await Promise.all([1, 2].map(() => api('/runs', { method: 'POST', body: JSON.stringify({ game: 'kart', action: 'push' }) })))
     assert.deepEqual([a.status, b.status].sort(), [202, 409])
@@ -185,5 +188,87 @@ describe('publisher -> tenant mirror', () => {
     await p2.idle()
     assert.equal((await p2.getRun(run2.id))?.status, 'ok')
     await rm(dir, { recursive: true, force: true })
+  })
+})
+
+describe('publisher -> per-request Wavedash token', () => {
+  test('the key reaches one CLI child as WAVEDASH_TOKEN, is never stored, and a malformed one is refused', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'pub-tok-'))
+    const bin = join(dir, 'wavedash')
+    const seen = join(dir, 'seen.log')
+    await writeFile(bin, `#!/bin/sh
+echo "tok=$WAVEDASH_TOKEN" >> "${seen}"
+echo "Build ID: bld_tok123456"
+exit 0
+`)
+    await chmod(bin, 0o755)
+    await mkdir(join(dir, 'home'), { recursive: true })
+    const p = createPublisher({
+      dataDir: dir, home: join(dir, 'home'), wavedashBin: bin, maxArtifactBytes: 200_000, keepArtifacts: 2, runTimeoutMs: 10_000,
+      games: { kekkai: { name: 'Kekkai', game_id: 'gid' } },
+    })
+    const { Readable } = await import('node:stream')
+    await p.saveArtifact('kekkai', Readable.from([await tarball({ 'index.html': 'x' })]))
+    const run = await p.startRun({ game: 'kekkai', action: 'push' }, 'wvd_secret_value_123')
+    await p.idle()
+    assert.match(await readFile(seen, 'utf8'), /tok=wvd_secret_value_123/)
+    const stored = await readFile(join(dir, 'runs', `${run.id}.json`), 'utf8')
+    assert.ok(!stored.includes('wvd_secret_value_123'))
+    await assert.rejects(p.startRun({ game: 'kekkai', action: 'push' }, 'bad token with spaces'), /invalid Wavedash token/)
+    await rm(dir, { recursive: true, force: true })
+  })
+})
+
+describe('publisher -> games come with the request (no games.json)', () => {
+  const GID = 'j97abcdef0123456789'
+  async function setup() {
+    const dir = await mkdtemp(join(tmpdir(), 'pub-dyn-'))
+    const bin = join(dir, 'wavedash')
+    await writeFile(bin, FAKE.replaceAll('__CALLS__', join(dir, 'calls.log')))
+    await chmod(bin, 0o755)
+    await mkdir(join(dir, 'home'), { recursive: true })
+    const p = createPublisher({ dataDir: dir, home: join(dir, 'home'), wavedashBin: bin, maxArtifactBytes: 200_000, keepArtifacts: 2, runTimeoutMs: 10_000 })
+    const { Readable } = await import('node:stream')
+    return { dir, p, up: async (slug: string) => p.saveArtifact(slug, Readable.from([await tarball({ 'index.html': 'x' })])) }
+  }
+
+  test('no cfg.games at all: the body game_id is used, publisher_id is echoed, any valid slug takes artifacts', async () => {
+    const { dir, p, up } = await setup()
+    await up('mission-7_x')
+    const run = await p.startRun({ game: 'mission-7_x', game_id: GID, name: 'My Game', publisher_id: 12, action: 'push' })
+    await p.idle()
+    const done = (await p.getRun(run.id))!
+    assert.equal(done.status, 'ok')
+    assert.equal(done.publisher_id, 12)
+    assert.match(done.message, /^My Game /)
+    assert.match(await readFile(join(dir, 'calls.log'), 'utf8'), new RegExp(`game_id = "${GID}"`))
+    assert.deepEqual(p.games(), [])
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  test('refusals: invalid slug, invalid game_id, unknown game without game_id', async () => {
+    const { dir, p } = await setup()
+    for (const game of ['../etc', 'A', 'a b', '', 'x'.repeat(33)])
+      await assert.rejects(p.startRun({ game, game_id: GID, action: 'push' }), /invalid game slug/)
+    for (const game_id of ['short', 'bad id!!!!!', 'a'.repeat(65), 'gid_with_underscore'])
+      await assert.rejects(p.startRun({ game: 'ok', game_id, action: 'push' }), /invalid game_id/)
+    await assert.rejects(p.startRun({ game: 'ok', action: 'push' }), /unknown game/)
+    await assert.rejects(p.saveArtifact('../x', (await import('node:stream')).Readable.from([Buffer.from('a')])), /invalid game slug/)
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  test('over HTTP: PUT /artifacts accepts a slug missing from the config; game_id in the body beats cfg.games', async () => {
+    const up = await api('/artifacts/freshgame', { method: 'PUT', body: await tarball({ 'index.html': 'x' }) })
+    assert.equal(up.status, 201)
+    const bad = await api('/runs', { method: 'POST', body: JSON.stringify({ game: 'freshgame', game_id: 'no', action: 'push' }) })
+    assert.equal(bad.status, 400)
+    const run = await api('/runs', { method: 'POST', body: JSON.stringify({ game: 'freshgame', game_id: GID, publisher_id: 5, action: 'push' }) })
+    assert.equal(run.status, 202)
+    assert.equal((await waitRun(run.json.id)).publisher_id, 5)
+    await api('/artifacts/kekkai', { method: 'PUT', body: await tarball({ 'index.html': 'y' }) })
+    const over = await api('/runs', { method: 'POST', body: JSON.stringify({ game: 'kekkai', game_id: GID, action: 'push' }) })
+    await waitRun(over.json.id)
+    const log = await readFile(calls, 'utf8')
+    assert.ok(log.lastIndexOf(`game_id = "${GID}"`) > log.lastIndexOf('gid_kekkai'))
   })
 })
