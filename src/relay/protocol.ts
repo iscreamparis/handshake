@@ -4,6 +4,8 @@ export const RELAY_PATH = '/ws'
 export const RELAY_TYPE_FIELD = 't'
 
 export const MAX_MSG_BYTES = 4 * 1024
+/** Extension messages (match, economy, saves, UGC) may be larger than a relay message: saves and player content. */
+export const MAX_EXT_BYTES = 512 * 1024
 export const MAX_INVALID = 10
 export const RATE_PER_SEC = 20
 export const RATE_PER_MIN = 400
@@ -121,13 +123,17 @@ function isValidRelayMessage(value: Record<string, unknown>): value is Record<st
 
 export function parseRelayMessage(raw: string): ParseRelayResult {
   if (typeof raw !== 'string') return { error: 'bad_message', message: 'message must be text' }
-  if (Buffer.byteLength(raw) > MAX_MSG_BYTES) return { error: 'bad_message', message: 'message too large' }
+  const bytes = Buffer.byteLength(raw)
+  if (bytes > MAX_EXT_BYTES) return { error: 'bad_message', message: 'message too large' }
+  const tooLarge = bytes > MAX_MSG_BYTES
   let parsed: unknown
-  try { parsed = JSON.parse(raw) } catch { return { error: 'bad_message', message: 'not JSON' } }
-  if (!isObject(parsed)) return { error: 'bad_message', message: 'message must be a JSON object' }
+  try { parsed = JSON.parse(raw) } catch { return { error: 'bad_message', message: tooLarge ? 'message too large' : 'not JSON' } }
+  if (!isObject(parsed)) return { error: 'bad_message', message: tooLarge ? 'message too large' : 'message must be a JSON object' }
   if (typeof parsed.t === 'string' && !(RELAY_TYPES as readonly string[]).includes(parsed.t)) {
     return { ext: parsed }
   }
+  // Only extension messages may exceed the 4 KiB of a relay message.
+  if (tooLarge) return { error: 'bad_message', message: 'message too large' }
   if (!isValidRelayMessage(parsed)) return { error: 'bad_message', message: 'invalid message' }
   return parsed
 }

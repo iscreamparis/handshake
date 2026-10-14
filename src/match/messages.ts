@@ -1,11 +1,13 @@
 import type { Outcome } from '../hooks.ts'
 import type { Provider, QueueName } from '../store/types.ts'
 import { RELAY_CLIENT_TYPES, RELAY_SERVER_TYPES, RELAY_TYPE_FIELD } from '../relay/protocol.ts'
+import { ONLINE_CLIENT_TYPES, ONLINE_ERROR_CODES, ONLINE_SERVER_TYPES, isOnlineClientType, parseOnlineMessage } from '../online/messages.ts'
+import type { OnlineClientMessage } from '../online/messages.ts'
 
 export const ECONOMY_CLIENT_TYPES = ['eco_get', 'eco_products', 'eco_reward', 'eco_buy', 'eco_open', 'eco_wavedash', 'eco_stripe'] as const
 export const ECONOMY_SERVER_TYPES = ['eco_state', 'eco_products', 'eco_reward', 'eco_bought', 'eco_opened', 'eco_purchase', 'eco_checkout'] as const
-export const MATCH_CLIENT_TYPES = ['auth', 'match_queue', 'match_unqueue', 'result', ...ECONOMY_CLIENT_TYPES] as const
-export const MATCH_SERVER_TYPES = ['authed', 'match_queued', 'match_unqueued', 'match', 'result_ack', 'match_end', ...ECONOMY_SERVER_TYPES] as const
+export const MATCH_CLIENT_TYPES = ['auth', 'match_queue', 'match_unqueue', 'result', ...ECONOMY_CLIENT_TYPES, ...ONLINE_CLIENT_TYPES] as const
+export const MATCH_SERVER_TYPES = ['authed', 'match_queued', 'match_unqueued', 'match', 'result_ack', 'match_end', ...ECONOMY_SERVER_TYPES, ...ONLINE_SERVER_TYPES] as const
 export const MATCH_ERROR_CODES = [
   'auth_required', 'already_authed', 'auth_failed', 'auth_unavailable',
   'already_queued', 'not_queued', 'in_match', 'ranked_busy',
@@ -13,6 +15,7 @@ export const MATCH_ERROR_CODES = [
   'store_unavailable',
   'economy_unavailable', 'insufficient_funds', 'no_packs', 'tx_conflict', 'unknown_product', 'unknown_reward', 'unknown_pack',
   'purchase_refunded', 'bad_receipt', 'receipt_mismatch', 'not_production', 'bad_return_url', 'payment_unavailable',
+  ...ONLINE_ERROR_CODES,
 ] as const
 
 const relayTypes: readonly string[] = [...RELAY_CLIENT_TYPES, ...RELAY_SERVER_TYPES]
@@ -36,6 +39,7 @@ export type MatchClientMessage =
   | { t: 'eco_open'; op: string; pack_type: string }
   | { t: 'eco_wavedash'; op?: string; receipt_jwt: string; user_jwt?: string }
   | { t: 'eco_stripe'; op?: string; product: string; return_url: string }
+  | OnlineClientMessage
 
 export type MatchServerMessage =
   | { t: 'authed'; player_id: string; display_name: string; provider: Provider }
@@ -52,6 +56,9 @@ export type MatchServerMessage =
   }
 
 export type EconomyClientMessage = Extract<MatchClientMessage, { t: typeof ECONOMY_CLIENT_TYPES[number] }>
+export function isOnlineMessage(m: MatchClientMessage): m is OnlineClientMessage {
+  return isOnlineClientType(m.t)
+}
 export function isEconomyMessage(m: MatchClientMessage): m is EconomyClientMessage {
   return (ECONOMY_CLIENT_TYPES as readonly string[]).includes(m.t)
 }
@@ -117,6 +124,10 @@ export function parseMatchMessage(raw: string | Record<string, unknown>): ParseM
       return { t: 'match_unqueue' }
     case 'eco_get': case 'eco_products': case 'eco_reward': case 'eco_buy': case 'eco_open': case 'eco_wavedash': case 'eco_stripe':
       return parseEconomy(type, value)
+    case 'save_list': case 'save_get': case 'save_put': case 'save_delete':
+    case 'ach_list': case 'stats_get': case 'stat_report': case 'ach_ack':
+    case 'ugc_create': case 'ugc_update': case 'ugc_list': case 'ugc_get': case 'ugc_delete':
+      return parseOnlineMessage(type, value)
     case 'result': {
       const { match_id, outcome } = value
       if (typeof match_id !== 'string' || match_id.length < 1 || match_id.length > 128) {

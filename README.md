@@ -94,6 +94,17 @@ Server-authoritative, per game (= per mission). Protocol: [docs/CONTRACT.md](doc
 - **Webhook URLs** (public, behind the reverse proxy): `https://<handshake host>/webhooks/wavedash` (Developer Portal > Webhooks) and `https://<handshake host>/webhooks/stripe` (Stripe dashboard, events `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `charge.refunded`). One Stripe endpoint serves every game (the session metadata names the game); the same account and webhook secret serve all missions of the tenant.
 - `etc_settings` `economy.allow_playtest` = `1` accepts Wavedash `PLAYTEST` receipts (test purchases). Leave it unset in production.
 
+## Cloud saves, stats, achievements, player content
+
+Server-authoritative, per game, over the mission tables (`etc_saves`, `etc_stats`, `etc_player_stats`, `etc_achievements`, `etc_player_achievements`, `etc_ugc`). Protocol: [docs/CONTRACT.md](docs/CONTRACT.md) section 9. Code: `src/saves/`, `src/achievements/`, `src/ugc/`, `src/online/`.
+
+- **Handshake is the source of truth, Wavedash a copy.** Wavedash has no server API for saves, achievements, stats or UGC; only the game client can write them. The server therefore returns what the client must copy (the `pending_sync` unlocks, the stat values, the saved data) and the client confirms with `ach_ack`. On a conflict Handshake wins by version. On itch.io and the web only Handshake is used.
+- **Saves** are versioned texts per `(player, key)` with compare-and-set: a stale write is refused and the server copy is returned (`save_conflict`); a replay is a success with `applied:false`. The table API has no DELETE, so a delete leaves a tombstone whose version keeps growing.
+- **Achievements** are data (backoffice page Achievements): a `stat` rule (stat reaches a threshold) or an `event` rule (first server event whose payload satisfies a filter such as `outcome=win,queue=ranked`). The server maintains built-in stats (matches, wins, streaks, rating peak, packs opened, unique cards, purchases) from what it sees; other stats are `client_writable` and reported with `stat_report` (idempotent by `op`, bounded by `max_delta`). An unlock is one insert guarded by the unique (player, achievement).
+- **UGC**: bounded text items (`json` validated, `text`, `base64`), PUBLIC or PRIVATE, owner-only update and delete, admin mask (`hidden`), cursor pagination. Content lives in the row (no disk), so the limits matter: `ugc.max_bytes`, `ugc.quota_bytes`, `ugc.max_items`, `ugc.writes_per_minute`, and for saves `saves.max_bytes`, `saves.quota_bytes`, `saves.max_keys`, `saves.writes_per_minute` are `etc_settings` rows of each game.
+- **Frames.** Extension messages (match, economy, online) may be up to 512 KiB (`MAX_EXT_BYTES`); relay messages stay at 4 KiB and the rooms endpoint at 64 KiB.
+- One Handshake instance: the compare-and-set and the quotas are serialised by an in-process per-player mutex. Two instances would need a database-side guard (the unique keys already protect the creates).
+
 ## Store contract suite
 
 The contract suite checks a `PlayerStore` implementation. It is exported from the `kart-rooms/contract` subpath, never from the main entry. Run it with `node:test`:

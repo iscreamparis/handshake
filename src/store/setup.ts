@@ -8,6 +8,7 @@ import type { StoreConfig } from './config.ts'
 import { createEconomyService } from '../economy/service.ts'
 import { createStripeBridge } from '../economy/stripe.ts'
 import type { Wavedash } from '../economy/wavedash.ts'
+import { createOnline } from '../online/index.ts'
 
 export type OpenedStores = GameRouter & { backends(): GameBackend[]; close(): void }
 
@@ -20,9 +21,10 @@ export async function openStores(cfg: StoreConfig, opts: {
 } = {}): Promise<OpenedStores> {
   if (cfg.mode === 'memory') {
     const store = createMemoryStore()
-    const economy = createEconomyService({ game: 'memory', api: createMemoryTableApi(), store, wavedash: opts.wavedash, log: opts.log })
+    const api = createMemoryTableApi()
+    const economy = createEconomyService({ game: 'memory', api, store, wavedash: opts.wavedash, log: opts.log })
     economy.start()
-    const router = singleStoreRouter(store, economy)
+    const router = singleStoreRouter(store, economy, createOnline(api, { log: opts.log }))
     return { ...router, backends: () => [router.resolve(undefined)!], close() { economy.stop() } }
   }
   const apis = Object.fromEntries(Object.entries(cfg.games).map(([game, apiKey]) =>

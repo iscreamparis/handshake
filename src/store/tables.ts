@@ -5,6 +5,7 @@
 export type Row = Record<string, unknown>
 export type Filter =
   | { field: string; op: "eq" | "ne"; value: unknown }
+  | { field: string; op: "gt" | "lt" | "gte" | "lte"; value: number }
   | { field: string; op: "in"; values: unknown[] }
   | { field: string; op: "is_null" | "not_null" }
 export interface TableQuery {
@@ -37,6 +38,12 @@ export const ETCITO_TABLES: Record<string, { columns: string[]; unique: string[]
   etc_packs: { columns: ["player_id", "pack_type", "quantity", "ledger_id", "updated_at"], unique: [["player_id", "pack_type"]] },
   etc_products: { columns: ["provider", "code", "label", "description", "price", "currency", "grant_coins", "grant_packs", "active", "sort_order", "created_at"], unique: [["provider", "code"]] },
   etc_purchases: { columns: ["provider", "external_id", "player_id", "product_code", "status", "payment_ref", "amount", "currency", "payload", "created_at", "granted_at", "refunded_at"], unique: [["provider", "external_id"]] },
+  etc_saves: { columns: ["player_id", "save_key", "version", "etag", "size", "data", "created_at", "updated_at"], unique: [["player_id", "save_key"]] },
+  etc_stats: { columns: ["code", "label", "description", "value_type", "aggregation", "client_writable", "max_delta", "active", "sort_order"], unique: [["code"]] },
+  etc_player_stats: { columns: ["player_id", "stat_code", "value", "updated_at"], unique: [["player_id", "stat_code"]] },
+  etc_achievements: { columns: ["code", "title_fr", "title_en", "description_fr", "description_en", "secret", "image", "rule_type", "rule_stat", "rule_threshold", "rule_event", "rule_filter", "active", "sort_order", "created_at"], unique: [["code"]] },
+  etc_player_achievements: { columns: ["player_id", "achievement_code", "unlocked_at", "synced_wavedash_at", "source"], unique: [["player_id", "achievement_code"]] },
+  etc_ugc: { columns: ["item_id", "player_id", "ugc_type", "title", "description", "visibility", "hidden", "content_type", "content", "size", "hash", "version", "wavedash_ref", "created_at", "updated_at"], unique: [["item_id"]] },
   etc_deploy_runs: { columns: ["run_id", "request_id", "game", "action", "artifact", "build_id", "status", "exit_code", "message", "started_at", "ended_at", "log"], unique: [["run_id"]] },
 }
 
@@ -45,6 +52,10 @@ function matches(row: Row, f: Filter): boolean {
   switch (f.op) {
     case "eq": return v === f.value
     case "ne": return v !== f.value
+    case "gt": return (v as number) > f.value
+    case "lt": return (v as number) < f.value
+    case "gte": return (v as number) >= f.value
+    case "lte": return (v as number) <= f.value
     case "in": return f.values.includes(v)
     case "is_null": return v === null || v === undefined
     case "not_null": return v !== null && v !== undefined

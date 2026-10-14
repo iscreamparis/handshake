@@ -7,6 +7,8 @@ import type { GameSettings } from './gamesettings.ts'
 import type { TableApi } from './tables.ts'
 import type { PlayerStore, QueueName } from './types.ts'
 import type { EconomyService } from '../economy/service.ts'
+import { createOnline } from '../online/index.ts'
+import type { OnlineServices } from '../online/index.ts'
 
 export interface GameBackend {
   /** Null for the legacy single shared store (any game name is accepted). */
@@ -15,6 +17,8 @@ export interface GameBackend {
   queues(): readonly QueueName[]
   /** The economy of the game (wallet, packs, cards, purchases); absent when none is configured. */
   economy?: EconomyService
+  /** Cloud saves, stats + achievements and player content of the game. */
+  online?: OnlineServices
 }
 
 export interface GameRouter {
@@ -23,8 +27,8 @@ export interface GameRouter {
 }
 
 /** One store for every game name (memory store, tests, embedding): the behaviour before multi-game support. */
-export function singleStoreRouter(store: PlayerStore, economy?: EconomyService): GameRouter {
-  const backend: GameBackend = { game: null, store, queues: () => DEFAULT_GAME_PARAMS.queues, ...(economy ? { economy } : {}) }
+export function singleStoreRouter(store: PlayerStore, economy?: EconomyService, online?: OnlineServices): GameRouter {
+  const backend: GameBackend = { game: null, store, queues: () => DEFAULT_GAME_PARAMS.queues, ...(economy ? { economy } : {}), ...(online ? { online } : {}) }
   return { resolve: () => backend }
 }
 
@@ -54,7 +58,8 @@ export async function createGameRouter(apis: Record<string, TableApi>, opts: {
     settings.push(s)
     const store = createHttpPlayerStore(api, { now: opts.now, elo: () => s.current().elo })
     const economy = opts.economy?.(game, api, store)
-    backends.set(game, { game, store, queues: () => s.current().queues, ...(economy ? { economy } : {}) })
+    const online = createOnline(api, { now: opts.now, log: opts.log })
+    backends.set(game, { game, store, queues: () => s.current().queues, ...(economy ? { economy } : {}), online })
   }
   for (const s of settings) s.start()
   for (const b of backends.values()) b.economy?.start()

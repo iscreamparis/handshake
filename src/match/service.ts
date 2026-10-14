@@ -11,7 +11,9 @@ import { resolveIdentity } from './auth.ts'
 import { Matchmaker } from './matchmaker.ts'
 import type { MatchPair, Waiter } from './matchmaker.ts'
 import { parseMatchMessage } from './messages.ts'
-import { isEconomyMessage } from './messages.ts'
+import { isEconomyMessage, isOnlineMessage } from './messages.ts'
+import type { OnlineClientMessage } from '../online/messages.ts'
+import type { EventName } from '../achievements/service.ts'
 import type { EconomyClientMessage, MatchClientMessage } from './messages.ts'
 import { StoreError } from '../store/errors.ts'
 import { EconomyUnavailable } from '../economy/service.ts'
@@ -152,10 +154,11 @@ export class MatchService implements RelayExtension {
   private error(conn: string, code: string): void { this.hub?.sendError(conn, code, code) }
 
   private async handle(conn: string, parsed: MatchClientMessage | { error: string }): Promise<void> {
-    if ('error' in parsed) return this.error(conn, parsed.error)
+    if ('error' in parsed) return this.error(conn, String(parsed.error))
     try {
       if (parsed.t === 'auth') await this.auth(conn, parsed)
       else if (isEconomyMessage(parsed)) await this.economy(conn, parsed)
+      else if (isOnlineMessage(parsed)) await this.online(conn, parsed)
       else if (parsed.t === 'match_queue') await this.enqueue(conn, parsed.game, parsed.queue)
       else if (parsed.t === 'match_unqueue') {
         if (this.mm.remove(conn)) this.send(conn, { t: 'match_unqueued' })
@@ -163,6 +166,7 @@ export class MatchService implements RelayExtension {
       } else await this.result(conn, parsed.match_id, parsed.outcome)
     } catch (err) {
       if (isEconomyMessage(parsed)) return this.economyError(conn, parsed, err)
+      if (isOnlineMessage(parsed)) return this.onlineError(conn, parsed, err)
       if (err instanceof StoreFailure) {
         this.deps.log('error', `[match] store ${err.detail} on ${parsed.t} from ${conn}`)
         this.error(conn, 'store_unavailable')
@@ -213,19 +217,33 @@ export class MatchService implements RelayExtension {
       case 'eco_products': return this.send(conn, { t: 'eco_products', ...echo, products: await eco.products() })
       case 'eco_reward': {
         const r = await eco.reward(pid, m.reward_id)
-        return this.send(conn, { t: 'eco_reward', ...echo, reward_id: m.reward_id, granted: r.result.granted, coins: r.result.coins, applied: r.applied })
+        this.send(conn, { t: 'eco_reward', ...echo, reward_id: m.reward_id, granted: r.result.granted, coins: r.result.coins, applied: r.applied })
+        if (r.applied) await this.emit(conn, me, 'reward', { reward_id: m.reward_id }, `rw:${m.reward_id}`)
+        return
       }
       case 'eco_buy': {
         const r = await eco.buy(pid, m.op, m.product, m.qty)
-        return this.send(conn, { t: 'eco_bought', ...echo, ...r.result, applied: r.applied })
+        this.send(conn, { t: 'eco_bought', ...echo, ...r.result, applied: r.applied })
+        if (r.applied) await this.emit(conn, me, 'purchase', { provider: 'coins', product: m.product, qty: m.qty }, `buy:${m.op}`)
+        return
       }
       case 'eco_open': {
         const r = await eco.open(pid, m.op, m.pack_type)
-        return this.send(conn, { t: 'eco_opened', ...echo, ...r.result, applied: r.applied })
+        this.send(conn, { t: 'eco_opened', ...echo, ...r.result, applied: r.applied })
+        if (r.applied) {
+          const st = await eco.state(pid).catch(() => null)
+          await this.emit(conn, me, 'pack_opened', {
+            pack_type: m.pack_type, new_cards: r.result.cards.filter((c) => c.is_new).length, duplicates: r.result.cards.filter((c) => c.duplicate).length,
+            ...(st ? { unique_cards: Object.keys(st.cards).length } : {}),
+          }, `open:${m.op}`)
+        }
+        return
       }
       case 'eco_wavedash': {
         const r = await eco.wavedashFromClient(pid, m.receipt_jwt, m.user_jwt)
-        return this.send(conn, { t: 'eco_purchase', ...echo, ...r })
+        this.send(conn, { t: 'eco_purchase', ...echo, ...r })
+        if (r.applied && r.status === 'granted') await this.emit(conn, me, 'purchase', { provider: 'wavedash', product: r.product }, `wd:${r.external_id}`)
+        return
       }
       case 'eco_stripe': {
         if (!/^https?:\/\/[^\s]+$/.test(m.return_url)) return this.economyError(conn, m, new StoreError('bad_argument', 'bad_return_url'))
@@ -233,6 +251,101 @@ export class MatchService implements RelayExtension {
         return this.send(conn, { t: 'eco_checkout', ...echo, url: s.url, session_id: s.session_id })
       }
     }
+  }
+
+  // --- online data: saves, stats + achievements, player content (docs/CONTRACT.md r5) ---------------------------------
+
+  /** Feeds a server event to the achievements of a player and pushes the new unlocks to the connection. Never throws. */
+  private async emit(conn: string, me: AuthedPlayer, name: EventName, payload: Record<string, unknown>, key: string): Promise<void> {
+    if (me.kind === 'resident') return
+    try {
+      const unlocked = await this.router.resolve(me.game ?? undefined)?.online?.progress.event(me.player_id, name, payload, key)
+      if (unlocked && unlocked.length > 0) this.send(conn, { t: 'ach_unlocked', achievements: unlocked })
+    } catch {
+      this.deps.log('error', `[achievements] event ${name} failed for ${me.player_id}`)
+    }
+  }
+
+  private async online(conn: string, m: OnlineClientMessage): Promise<void> {
+    const me = this.authed.get(conn)
+    if (!me) return this.error(conn, 'auth_required')
+    const on = this.router.resolve(me.game ?? undefined)?.online
+    if (!on) return this.error(conn, 'online_unavailable')
+    const echo = m.op !== undefined ? { op: m.op } : {}
+    const pid = me.player_id
+    const s = (k: string): string => m[k] as string
+    const none = { version: 0, etag: '', size: 0, updated_at: 0, data: '' }
+    switch (m.t) {
+      case 'save_list': return this.send(conn, { t: 'save_list', ...echo, ...(await on.saves.list(pid)) })
+      case 'save_get': {
+        const r = await on.saves.get(pid, s('key'))
+        return this.send(conn, { t: 'save_data', ...echo, key: s('key'), exists: r !== null, ...(r ?? none) })
+      }
+      case 'save_put': {
+        try {
+          const r = await on.saves.put(pid, s('key'), m.base_version as number, s('data'))
+          return this.send(conn, { t: 'save_ok', ...echo, ...r.save, applied: r.applied })
+        } catch (err) {
+          if (err instanceof StoreError && err.code === 'version_conflict') {
+            const cur = err.detail as typeof none | null
+            return this.send(conn, { t: 'save_conflict', ...echo, key: s('key'), exists: cur !== null, ...(cur ?? none) })
+          }
+          throw err
+        }
+      }
+      case 'save_delete': {
+        try {
+          const r = await on.saves.remove(pid, s('key'), m.base_version as number)
+          return this.send(conn, { t: 'save_deleted', ...echo, key: s('key'), deleted: r.deleted, applied: r.applied })
+        } catch (err) {
+          if (err instanceof StoreError && err.code === 'version_conflict') {
+            const cur = err.detail as typeof none | null
+            return this.send(conn, { t: 'save_conflict', ...echo, key: s('key'), exists: cur !== null, ...(cur ?? none) })
+          }
+          throw err
+        }
+      }
+      case 'ach_list': return this.send(conn, { t: 'ach_list', ...echo, ...(await on.progress.list(pid)) })
+      case 'stats_get': return this.send(conn, { t: 'stats', ...echo, stats: await on.progress.stats(pid) })
+      case 'stat_report': {
+        const r = await on.progress.report(pid, s('op'), s('stat'), m.value as number)
+        this.send(conn, { t: 'stat_value', ...echo, stat: r.stat, value: r.value, applied: r.applied })
+        if (r.unlocked.length > 0) this.send(conn, { t: 'ach_unlocked', achievements: r.unlocked })
+        return
+      }
+      case 'ach_ack': return this.send(conn, { t: 'ach_acked', ...echo, codes: await on.progress.ack(pid, m.codes as string[]) })
+      case 'ugc_create': {
+        const { t: _t, op: _op, ...input } = m
+        const r = await on.ugc.create(pid, input, m.op)
+        return this.send(conn, { t: 'ugc_saved', ...echo, item: r.item, applied: r.applied })
+      }
+      case 'ugc_update': {
+        const { t: _t, op: _op, id: _id, base_version: _bv, ...patch } = m
+        const r = await on.ugc.update(pid, s('id'), patch, m.base_version as number | undefined)
+        return this.send(conn, { t: 'ugc_saved', ...echo, item: r.item, applied: r.applied })
+      }
+      case 'ugc_list': {
+        const r = await on.ugc.list(pid, { owner: m.owner as string | undefined, type: m.type as string | undefined, visibility: m.visibility as string | undefined, cursor: m.cursor as string | undefined, limit: m.limit as number | undefined })
+        return this.send(conn, { t: 'ugc_list', ...echo, items: r.items, next_cursor: r.next_cursor })
+      }
+      case 'ugc_get': return this.send(conn, { t: 'ugc_item', ...echo, item: await on.ugc.get(pid, s('id')) })
+      case 'ugc_delete': {
+        const r = await on.ugc.remove(pid, s('id'))
+        return this.send(conn, { t: 'ugc_deleted', ...echo, id: s('id'), deleted: r.deleted })
+      }
+    }
+  }
+
+  private onlineError(conn: string, m: { t: string; op?: string }, err: unknown): void {
+    let code = 'store_unavailable'
+    let extra: Record<string, unknown> = {}
+    if (err instanceof StoreError) {
+      code = err.code === 'bad_argument' ? 'bad_message' : err.code
+      if (err.code === 'version_conflict') extra = { item: err.detail }
+    } else {
+      this.deps.log('error', `[online] ${m.t} failed: ${err instanceof Error ? err.name : 'error'}`)
+    }
+    this.hub?.send(conn, { t: 'error', reason: code, ...(m.op !== undefined ? { op: m.op } : {}), ...extra })
   }
 
   private economyError(conn: string, m: { t: string; op?: string }, err: unknown): void {
@@ -492,6 +605,17 @@ export class MatchService implements RelayExtension {
     })
     if (status === 'forfeit' || reason === 'no_report' || reason === 'both_disconnected') {
       this.hub?.endSession(match.session, reason)
+    }
+    if (score_a !== null) {
+      match.players.forEach((pid, seat) => {
+        if (match.residents[seat]) return
+        const score = seat === 0 ? score_a : 1 - score_a
+        const r = ratings?.[seat]
+        void this.emit(match.conns[seat]!, match.auth[seat], 'match_end', {
+          outcome: OUTCOME(score), queue: match.queue, status,
+          ...(r ? { rating_before: r.before, rating_after: r.after, placement: r.placement } : {}),
+        }, match.match_id)
+      })
     }
     match.residents.forEach((r, seat) => { if (r) this.hub?.disconnect(match.conns[seat]) })
     this.deps.log('info', `[match] ${status} ${reason} ${match.match_id}`)

@@ -1,4 +1,4 @@
-# Etcito online contract (r4)
+# Etcito online contract (r5)
 
 The shared rules of the Etcito game server, Handshake, the AI residents and every game client (first: Kekkai).
 One authority: this file. A change = a new revision number + one changelog line at the bottom. Written in English.
@@ -136,8 +136,72 @@ Purchases are keyed by the provider's id (`purchaseId`, Checkout session id). A 
 - A refund may take the coin balance below zero: spending is refused until it is positive again. Cards already revealed are never removed.
 - A profile (wallet, packs, collection) belongs to one game: the same Wavedash id in two games has two unrelated economies.
 
+## 9. Cloud saves, stats, achievements, player content (r5)
+
+Everything below needs `auth` (else `auth_required`) and belongs to one game (= mission), like the economy. **Handshake is the source of
+truth; Wavedash is a convenience copy** (section 9.5). Frames may now be up to 512 KiB for these messages (relay messages stay at 4 KiB;
+a frame over the cap closes the socket with 1009, so keep `saves.max_bytes` / `ugc.max_bytes` well below it: the defaults are 192 KiB).
+Errors are `{ t:'error', reason, op? }`; new reasons: `online_unavailable`, `version_conflict`, `too_large`, `quota_exceeded`, `forbidden`,
+`rate_limited`, `not_found`, `unknown_stat`, `stat_not_writable` (invalid fields stay `bad_message`, a reused `op` with other parameters `tx_conflict`).
+
+### 9.1 Limits (data, per game)
+`etc_settings` rows, all optional integers: `saves.max_bytes` (192 KiB per key), `saves.quota_bytes` (2 MiB per player), `saves.max_keys` (32),
+`saves.writes_per_minute` (60), `ugc.max_bytes` (192 KiB per item), `ugc.quota_bytes` (4 MiB per player), `ugc.max_items` (100),
+`ugc.writes_per_minute` (30; 0 = no limit). Cached 30 s. Sizes are UTF-8 bytes.
+
+### 9.2 Cloud saves (`etc_saves`)
+A save is a text (`data`: the client stringifies its JSON, or base64 for binary) under a `key` (`[A-Za-z0-9][A-Za-z0-9_.-]{0,63}`, e.g. `decks`,
+`profile`), with an integer `version` (1 at creation, +1 per write) and an `etag` (first 16 hex of SHA-256 of `data`).
+- `save_list` {}. Replies `save_list` { saves: [{key, version, etag, size, updated_at}], quota: {used, max_bytes, keys, max_keys, max_key_bytes} }.
+- `save_get` { key }. Replies `save_data` { key, exists, version, etag, size, updated_at, data } (`exists:false`, version 0 when there is none).
+- `save_put` { op?, key, base_version, data }. `base_version` is the version the client based its edit on (0 = "I believe there is none").
+  Compare-and-set: when the server version is `base_version`, the save is stored and the reply is `save_ok` { key, version, etag, size, updated_at, applied:true }.
+  A replay of the very same write (same base, same content, e.g. after a lost reply) answers `save_ok` with `applied:false`. Any other case answers
+  **`save_conflict`** { key, exists, version, etag, size, updated_at, data } = the SERVER copy; nothing is written. Errors `too_large`, `quota_exceeded`, `rate_limited`.
+- `save_delete` { op?, key, base_version }. Replies `save_deleted` { key, deleted, applied } or `save_conflict`. A deleted key reads as `exists:false`; the version keeps growing on a recreate.
+
+### 9.3 Stats and achievements (`etc_stats`, `etc_achievements`, `etc_player_stats`, `etc_player_achievements`)
+The server alone unlocks. Definitions are rows edited in the backoffice (page Achievements): `etc_stats` (`code`, aggregation `sum|max|min|last`, `value_type int|float`,
+`client_writable`, `max_delta`) and `etc_achievements` (`code` = the Wavedash identifier, titles/descriptions fr+en, `secret`, `image`, rule). Rules:
+`stat` (`rule_stat` reaches `rule_threshold`: `>=`, `<=` for a `min` stat), `event` (`rule_event` + optional `rule_filter`, first matching event), `manual` (backoffice only).
+The server maintains **built-in stats** for every game: `matches_played`, `matches_won`, `matches_lost`, `matches_drawn`, `ranked_matches_played`, `ranked_matches_won`,
+`win_streak_current`, `win_streak_best`, `rating_peak`, `packs_opened`, `cards_unique`, `purchases`, `rewards_claimed` (never client-writable).
+**Server events** (the client does not send them; they happen when it plays): `match_end` { outcome win|loss|draw, queue, status, rating_before?, rating_after?, placement? }
+(once per player and match, void matches excluded), `pack_opened` { pack_type, new_cards, duplicates, unique_cards }, `purchase` { provider, product }, `reward` { reward_id }.
+`rule_filter` is a comma list of conditions over those fields: `outcome=win,queue=ranked,rating_after>=2800` (`= != >= <= > <`).
+- `ach_list` {}. Replies `ach_list` { achievements: [{code, title:{fr,en}, description:{fr,en}, secret, image, unlocked, unlocked_at, synced, progress:{stat,value,threshold}|null}], pending_sync: [code] }.
+  A locked secret achievement shows title `???`, no description, no progress. Achievements added later whose stat is already reached unlock at this call.
+- `stats_get` {}. Replies `stats` { stats: {<stat code>: value} } (the values to copy to Wavedash with `setStat` + `storeStats`).
+- `stat_report` { op, stat, value }. Only for a stat with `client_writable`: `sum` adds `value` (>= 0), `max`/`min` keep the best, `last` replaces; `int` stats take integers; `max_delta` bounds `|value|`.
+  Replies `stat_value` { stat, value, applied }; `applied:false` for a replay of `op`. Errors `unknown_stat`, `stat_not_writable`, `tx_conflict`.
+- `ach_ack` { op?, codes: [code] }. The client confirms it copied these unlocks to Wavedash. Replies `ach_acked` { codes } (the ones that were pending).
+- Pushed by the server, to the connection concerned, right after the request or the match end that caused it: **`ach_unlocked`** { achievements: [same objects as ach_list, unlocked:true] }.
+
+### 9.4 Player content (`etc_ugc`)
+Items (levels, mods, maps, screenshots) with a bounded text `content` (`content_type` `json` is validated, `text`, or `base64` is validated). `type`: `SCREENSHOT|VIDEO|COMMUNITY|GAME_MANAGED|OTHER` (Wavedash's),
+`visibility`: `PUBLIC|PRIVATE`, `title` 1..80, `description` <= 500, optional `wavedash_ref` (the Wavedash UGC id when the client also created one). Item ids are `u_<hex>`. The owner alone updates or deletes;
+a PRIVATE item does not exist for anyone else (`not_found`); the admin can mask an item (`hidden`), which removes it for everyone but its owner.
+- `ugc_create` { op?, type?, title, description?, visibility?, content_type?, content, wavedash_ref? }. Defaults `COMMUNITY`, `PRIVATE`, `json`. With `op`, a replay returns the same item. Replies `ugc_saved` { item, applied }.
+- `ugc_update` { id, base_version?, <any field of create> }. Replies `ugc_saved`; `version_conflict` (with `item` = the server meta) when `base_version` differs; `forbidden` for a non-owner of a visible item.
+- `ugc_list` { owner? (`me` or a player id), type?, visibility?, cursor?, limit? (1..50, default 20) }. Newest first, without content. Replies `ugc_list` { items: [meta], next_cursor: string|null } (pass it back as `cursor`).
+  Without `owner`: everybody's PUBLIC items. `owner:'me'`: all of yours, hidden ones flagged.
+- `ugc_get` { id }. Replies `ugc_item` { item: meta + content }.
+- `ugc_delete` { id }. Replies `ugc_deleted` { id, deleted }.
+`meta` = { id, owner, type, title, description, visibility, content_type, size, hash, version, wavedash_ref, hidden, created_at, updated_at }.
+
+### 9.5 Wavedash copy (client side, never authoritative)
+Wavedash has no server API for saves, achievements, stats or UGC: only the game client can write them. So, on Wavedash only:
+- **Saves**: after a `save_ok`, write the same `{version, etag, data}` to Wavedash Remote Storage (`uploadRemoteFile`, file `nmc/<key>.json`; 30 uploads/min, 300/h per player: coalesce). At start, ask Handshake first;
+  if Handshake is unreachable, read the Wavedash copy and play on it. When Handshake comes back, `save_put` with `base_version` = the last server version you knew: a `save_conflict` means Handshake moved on and **Handshake wins**
+  (replace the local copy, or let the player choose when he played offline). A Wavedash copy with a version higher than the server's is only ever pushed through a normal `save_put`.
+- **Achievements / stats**: on `ach_unlocked`, and for each code of `pending_sync` at start, call `setAchievement(code)` and `storeStats()` (and `setStat(code, value)` for the values of `stats_get`), then send `ach_ack`.
+  The Wavedash identifiers are the `code`s of `etc_achievements` / `etc_stats`; the catalogue is pushed to the Wavedash portal from the backoffice (a deliberate button).
+- **UGC**: Handshake stores the content; the client may also `createUGCItem` on Wavedash and keep its id in `wavedash_ref` (`ugc_update`). Leaderboard scores that point to an item use that id.
+On itch.io and the web, only Handshake is used.
+
 ## Changelog
 - r1 (2026-10-12): first version.
 - r2 (2026-10-14): section 7 Messages written by the Handshake project.
 - r3 (2026-10-14): `auth` gains an optional `game` (one player list per game); `bad_message` for an unknown or mismatched game; `bad_queue` also for a queue the game does not offer. Additive.
 - r4 (2026-10-15): economy messages (`eco_*`), server-side pack opening from data, Wavedash consumable receipts and Stripe Checkout, payment webhooks, tables `etc_wallets` / `etc_cards` / `etc_packs` / `etc_products` / `etc_purchases`. Additive.
+- r5 (2026-10-15): cloud saves with compare-and-set (`save_*`), server-evaluated stats and achievements (`ach_*`, `stats_get`, `stat_report`, `ach_unlocked`), player content (`ugc_*`), extension frames up to 512 KiB, tables `etc_saves` / `etc_stats` / `etc_player_stats` / `etc_achievements` / `etc_player_achievements` / `etc_ugc`. Additive.
