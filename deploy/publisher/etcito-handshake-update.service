@@ -1,0 +1,9 @@
+[Unit]
+Description=Update Handshake (kart-rooms) from a requested git ref, with backup and automatic rollback
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/bin/sh /opt/etcito-publisher/deploy/publisher/handshake-update.sh
+TimeoutStartSec=600
+Nice=10

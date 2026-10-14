@@ -1,6 +1,7 @@
 // HTTP front of the publisher (localhost only, behind nginx; bearer service key).
 import { timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import type { HandshakeUpdater } from './handshake.ts'
 import { PublisherError, type Publisher, type RunRequest } from './runner.ts'
 
 function send(res: ServerResponse, status: number, body: unknown): void {
@@ -32,9 +33,13 @@ const wavedashToken = (req: IncomingMessage): string | undefined => {
   const h = req.headers['x-wavedash-token']
   return typeof h === 'string' && h !== '' ? h : undefined
 }
+const itchToken = (req: IncomingMessage): string | undefined => {
+  const h = req.headers['x-itch-token']
+  return typeof h === 'string' && h !== '' ? h : undefined
+}
 const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined)
 
-export function createPublisherServer(publisher: Publisher, opts: { key: string }): Server {
+export function createPublisherServer(publisher: Publisher, opts: { key: string; handshake?: HandshakeUpdater }): Server {
   if (opts.key.length < 24) throw new Error('PUBLISHER_KEY must be at least 24 characters')
   return createServer(async (req, res) => {
     try {
@@ -47,6 +52,13 @@ export function createPublisherServer(publisher: Publisher, opts: { key: string 
       if (req.method === 'GET' && path === '/auth/status') return send(res, 200, await publisher.authStatus(wavedashToken(req)))
       if (req.method === 'GET' && path === '/runs') return send(res, 200, { runs: await publisher.listRuns() })
 
+      if (req.method === 'GET' && path === '/itch/status') return send(res, 200, await publisher.itchStatus(url.searchParams.get('target') ?? '', itchToken(req)))
+      if (opts.handshake && req.method === 'GET' && path === '/handshake/status') return send(res, 200, await opts.handshake.status())
+      if (opts.handshake && req.method === 'POST' && path === '/handshake/update') {
+        const b = await readJson(req)
+        return send(res, 202, await opts.handshake.start(b.repo, b.ref))
+      }
+
       let m = /^\/runs\/([0-9a-f-]{36})$/.exec(path)
       if (req.method === 'GET' && m) {
         const run = await publisher.getRun(m[1]!)
@@ -57,11 +69,11 @@ export function createPublisherServer(publisher: Publisher, opts: { key: string 
         const body: RunRequest = {
           game: str(b.game) ?? '', game_id: str(b.game_id), name: str(b.name),
           publisher_id: typeof b.publisher_id === 'number' || typeof b.publisher_id === 'string' ? b.publisher_id : undefined,
-          action: str(b.action) as RunRequest['action'], artifact: str(b.artifact), build_id: str(b.build_id),
+          platform: str(b.platform) as RunRequest['platform'], action: str(b.action) as RunRequest['action'], artifact: str(b.artifact), build_id: str(b.build_id),
           message: str(b.message), title: str(b.title), summary: str(b.summary),
           request_id: typeof b.request_id === 'number' || typeof b.request_id === 'string' ? b.request_id : undefined,
         }
-        return send(res, 202, await publisher.startRun(body, wavedashToken(req)))
+        return send(res, 202, await publisher.startRun(body, wavedashToken(req), itchToken(req)))
       }
       m = /^\/artifacts\/([a-z0-9_-]{1,32})$/.exec(path)
       if (m && req.method === 'GET') return send(res, 200, { artifacts: await publisher.listArtifacts(m[1]!) })

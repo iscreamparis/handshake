@@ -17,6 +17,8 @@ export interface PublisherConfig {
   /** HOME of the service user: where the wavedash CLI keeps its own credentials. */
   home: string
   wavedashBin: string
+  /** itch.io's `butler` (platform "itch"); default `butler`. */
+  butlerBin?: string
   /** Optional static table (compat): the normal path is a request that carries game + game_id. */
   games?: Record<string, GameConfig>
   maxArtifactBytes: number
@@ -26,9 +28,11 @@ export interface PublisherConfig {
   recorder?: TableApi
 }
 export type RunStatus = 'queued' | 'running' | 'ok' | 'failed'
+export type Platform = 'wavedash' | 'itch'
 export interface Run {
   id: string
   game: string
+  platform?: Platform
   action: 'push' | 'publish'
   artifact: string | null
   build_id: string | null
@@ -45,8 +49,10 @@ export interface Run {
 export interface RunRequest {
   /** Slug, also the artifacts folder. */
   game: string
-  /** Wavedash game id; takes precedence over cfg.games[game]. */
+  /** Wavedash game id; takes precedence over cfg.games[game]. For platform "itch": the target `user/game:channel`. */
   game_id?: string
+  /** Default "wavedash". "itch" only supports action "push" (butler has no separate publish). */
+  platform?: Platform
   /** Display label (<= 80). */
   name?: string
   publisher_id?: number | string
@@ -67,7 +73,9 @@ export class PublisherError extends Error {
 const GAME_RE = /^[a-z0-9_-]{1,32}$/
 const GAME_ID_RE = /^[A-Za-z0-9]{8,64}$/
 const ARTIFACT_RE = /^[0-9]{13}-[0-9a-f]{8}\.tar\.gz$/
-const BUILD_ID_RE = /^[A-Za-z0-9_-]{6,64}$/
+/** itch.io butler target: user/game:channel. */
+export const ITCH_TARGET_RE = /^[A-Za-z0-9_-]{1,50}\/[A-Za-z0-9_-]{1,80}:[A-Za-z0-9_.-]{1,50}$/
+const BUILD_ID_RE =/^[A-Za-z0-9_-]{6,64}$/
 const LOG_MAX = 64 * 1024
 
 /** The CLI prints the build ID and a playtest URL; the exact text is not documented, so accept the usual shapes. */
@@ -116,9 +124,16 @@ export function createPublisher(cfg: PublisherConfig) {
     if (typeof game !== 'string' || !GAME_RE.test(game)) throw new PublisherError(400, 'invalid game slug')
   }
   /** game_id from the request wins; otherwise the optional static table; otherwise 400. */
-  function resolveGame(req: { game: string; game_id?: string; name?: string }): GameConfig {
+  function resolveGame(req: { game: string; game_id?: string; name?: string; platform?: Platform }): GameConfig {
     checkSlug(req.game)
     const label = clean(req.name, 80)
+    if (req.platform === 'itch') {
+      const target = req.game_id ?? ''
+      if (!ITCH_TARGET_RE.test(target) || target === 'a-renseigner' || /a-renseigner/.test(target)) {
+        throw new PublisherError(400, 'itch: external_id must be user/game:channel (e.g. monuser/monjeu:html5)')
+      }
+      return { name: label || req.game, game_id: target }
+    }
     if (req.game_id !== undefined && req.game_id !== '') {
       if (!GAME_ID_RE.test(req.game_id)) throw new PublisherError(400, 'invalid game_id')
       return { name: label || cfg.games?.[req.game]?.name || req.game, game_id: req.game_id }
@@ -136,10 +151,17 @@ export function createPublisher(cfg: PublisherConfig) {
     return { WAVEDASH_TOKEN: token }
   }
 
-  function exec(args: string[], cwd: string, run: Run, extraEnv: Record<string, string> = {}): Promise<{ code: number | null; out: string }> {
+  /** The itch key arrives per request like the Wavedash one: ONE child gets it as BUTLER_API_KEY, never stored or logged. */
+  function itchEnv(key?: string): Record<string, string> {
+    if (key === undefined || key === '') return {}
+    if (!/^[!-~]{8,512}$/.test(key)) throw new PublisherError(400, 'invalid itch API key')
+    return { BUTLER_API_KEY: key }
+  }
+
+  function exec(args: string[], cwd: string, run: Run, extraEnv: Record<string, string> = {}, bin: string = cfg.wavedashBin): Promise<{ code: number | null; out: string }> {
     return new Promise(resolve => {
       let out = ''
-      const child = spawn(cfg.wavedashBin, args, {
+      const child = spawn(bin, args, {
         cwd, shell: false,
         env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: cfg.home, CI: '1', ...extraEnv },
       })
@@ -164,6 +186,14 @@ export function createPublisher(cfg: PublisherConfig) {
     const work = join(dirs.work, run.id)
     await mkdir(join(work, 'dist'), { recursive: true })
     try {
+      if (run.platform === 'itch') {
+        const code = await untar(join(dirs.artifacts, run.game, run.artifact!), join(work, 'dist'), run)
+        if (code !== 0) { run.exit_code = code; run.status = 'failed'; return }
+        const r = await exec(['push', '--userversion', run.message, join(work, 'dist'), game.game_id], work, run, env, cfg.butlerBin ?? 'butler')
+        run.exit_code = r.code
+        run.status = r.code === 0 ? 'ok' : 'failed'
+        return
+      }
       await writeFile(join(work, 'wavedash.toml'), `game_id = "${game.game_id}"\nupload_dir = "./dist"\n`)
       let result: { code: number | null; out: string }
       if (run.action === 'push') {
@@ -238,10 +268,14 @@ export function createPublisher(cfg: PublisherConfig) {
     return { artifact, bytes, sha256: hash.digest('hex') }
   }
 
-  async function startRun(req: RunRequest, token?: string): Promise<Run> {
-    const env = tokenEnv(token)
-    const game = resolveGame(req)
+  async function startRun(req: RunRequest, token?: string, itchKey?: string): Promise<Run> {
+    const platform: Platform = req.platform === 'itch' ? 'itch' : 'wavedash'
+    if (req.platform !== undefined && req.platform !== 'itch' && req.platform !== 'wavedash') throw new PublisherError(400, 'unknown platform')
+    const env = platform === 'itch' ? itchEnv(itchKey) : tokenEnv(token)
+    if (platform === 'itch' && !env.BUTLER_API_KEY) throw new PublisherError(409, 'itch: API key missing (Réglage itch_api_key)')
+    const game = resolveGame({ ...req, platform })
     if (req.action !== 'push' && req.action !== 'publish') throw new PublisherError(400, 'action must be push or publish')
+    if (platform === 'itch' && req.action !== 'push') throw new PublisherError(400, 'itch has no separate publish: use push')
     let artifact: string | null = null
     let buildId: string | null = null
     if (req.action === 'push') {
@@ -264,7 +298,7 @@ export function createPublisher(cfg: PublisherConfig) {
     }
     if ([...live.values()].some(r => r.game === req.game && (r.status === 'queued' || r.status === 'running'))) throw new PublisherError(409, 'a run is already in progress for this game')
     const run: Run = {
-      id: randomUUID(), game: req.game, action: req.action, artifact, build_id: buildId, request_id: requestId,
+      id: randomUUID(), game: req.game, platform, action: req.action, artifact, build_id: buildId, request_id: requestId,
       publisher_id: publisherId,
       message: clean(req.message, 200) || `${game.name} ${new Date().toISOString().slice(0, 16)}Z`,
       status: 'queued', exit_code: null, started_at: Date.now(), ended_at: null, log: '',
@@ -310,7 +344,18 @@ export function createPublisher(cfg: PublisherConfig) {
     return { authenticated: r.code === 0 && /authenticated/i.test(text) && !/not authenticated/i.test(text), detail: text.slice(0, 300) }
   }
 
+  /** `butler status target` (read-only): needs the itch key. */
+  async function itchStatus(target: string, key?: string): Promise<{ ok: boolean; detail: string }> {
+    if (!ITCH_TARGET_RE.test(target) || /a-renseigner/.test(target)) throw new PublisherError(400, 'itch: external_id must be user/game:channel')
+    const env = itchEnv(key)
+    if (!env.BUTLER_API_KEY) throw new PublisherError(409, 'itch: API key missing (Réglage itch_api_key)')
+    const probe: Run = { id: 'itch', game: '', action: 'push', artifact: null, build_id: null, request_id: null, publisher_id: null, message: '', status: 'running', exit_code: null, started_at: Date.now(), ended_at: null, log: '' }
+    const r = await exec(['status', target], cfg.dataDir, probe, env, cfg.butlerBin ?? 'butler')
+    return { ok: r.code === 0, detail: r.out.replace(/\u001b\[[0-9;]*m/g, '').trim().slice(0, 600) }
+  }
+
   return {
+    itchStatus,
     games: () => Object.entries(cfg.games ?? {}).map(([id, g]) => ({ id, name: g.name })),
     listArtifacts, saveArtifact, startRun, getRun, listRuns, authStatus,
     /** Resolves when every queued run has finished (tests, graceful shutdown). */

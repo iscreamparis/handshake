@@ -27,6 +27,31 @@ if [ ! -x "$DATA/home/.cargo/bin/wavedash" ]; then
   rm -f "$tmp"
 fi
 
+# itch.io `butler` for the user etcito (idempotent). The itch API key is NOT here: the backoffice hands it
+# to the publisher per request (X-Itch-Token -> BUTLER_API_KEY for that one child process).
+BUTLER="$DATA/home/.butler/butler"
+if [ ! -x "$BUTLER" ]; then
+  tmpz="$(mktemp)"
+  curl -fsSL https://broth.itch.zone/butler/linux-amd64/LATEST/archive/default -o "$tmpz"
+  mkdir -p "$DATA/home/.butler"
+  python3 - "$tmpz" "$DATA/home/.butler" <<'PY'
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1]); z.extractall(sys.argv[2])
+PY
+  rm -f "$tmpz"
+  chmod 755 "$DATA/home/.butler/butler"
+  chown -R etcito:etcito "$DATA/home/.butler"
+fi
+grep -q '^BUTLER_BIN=' "$ENVFILE" 2>/dev/null || { [ -f "$ENVFILE" ] && echo "BUTLER_BIN=$BUTLER" >> "$ENVFILE"; }
+
+# Handshake self-update: the publisher (unprivileged) only drops a validated request file in
+# $DATA/handshake; the root unit below does the swap/restart/rollback of /opt/kart-rooms.
+mkdir -p "$DATA/handshake"
+chown etcito:etcito "$DATA/handshake"
+install -m 644 "$HERE/etcito-handshake-update.service" /etc/systemd/system/etcito-handshake-update.service
+install -m 644 "$HERE/etcito-handshake-update.path" /etc/systemd/system/etcito-handshake-update.path
+chmod 755 "$HERE/handshake-update.sh"
+
 if [ ! -f "$ENVFILE" ]; then
   umask 027
   {
@@ -36,6 +61,7 @@ if [ ! -f "$ENVFILE" ]; then
     echo "PUBLISHER_DATA=$DATA"
     echo "PUBLISHER_HOME=$DATA/home"
     echo "WAVEDASH_BIN=$DATA/home/.cargo/bin/wavedash"
+    echo "BUTLER_BIN=$BUTLER"
   } > "$ENVFILE"
   chown root:etcito "$ENVFILE"
   chmod 640 "$ENVFILE"
@@ -43,6 +69,7 @@ fi
 
 install -m 644 "$HERE/etcito-publisher.service" /etc/systemd/system/etcito-publisher.service
 systemctl daemon-reload
+systemctl enable --now etcito-handshake-update.path >/dev/null 2>&1 || true
 systemctl enable etcito-publisher >/dev/null 2>&1 || true
 systemctl restart etcito-publisher
 sleep 2

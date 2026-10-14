@@ -1,0 +1,9 @@
+[Unit]
+Description=Handshake update requests from the Etcito publisher
+
+[Path]
+PathExists=/var/lib/etcito-publisher/handshake/request.env
+Unit=etcito-handshake-update.service
+
+[Install]
+WantedBy=multi-user.target
