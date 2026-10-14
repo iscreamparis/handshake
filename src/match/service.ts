@@ -5,6 +5,8 @@ import type { ClientConn } from '../hub.ts'
 import { RELAY_PATH } from '../relay/protocol.ts'
 import type { RelayExtension, RelayHub, RelaySeatRef } from '../relay/hub.ts'
 import type { PlayerKind, PlayerStore, Provider, QueueName, RatingChange } from '../store/types.ts'
+import { singleStoreRouter } from '../store/games.ts'
+import type { GameRouter } from '../store/games.ts'
 import { resolveIdentity } from './auth.ts'
 import { Matchmaker } from './matchmaker.ts'
 import type { MatchPair, Waiter } from './matchmaker.ts'
@@ -16,7 +18,8 @@ export const RESULT_WAIT_MS = 60000
 
 export interface MatchDeps { now(): number; log(level: string, msg: string): void }
 
-interface AuthedPlayer { player_id: string; display_name: string; provider: Provider; kind: PlayerKind }
+/** `game` is the game the connection authenticated into (null with a single shared store: any game). */
+interface AuthedPlayer { player_id: string; display_name: string; provider: Provider; kind: PlayerKind; game: string | null }
 
 interface ActiveMatch {
   match_id: string
@@ -56,7 +59,7 @@ async function st<T>(p: Promise<T>): Promise<T> {
 
 export class MatchService implements RelayExtension {
   private deps: MatchDeps
-  private store: PlayerStore
+  private router: GameRouter
   private hooks: HandshakeHooks
   private hub: RelayHub | null = null
   private mm = new Matchmaker()
@@ -69,13 +72,21 @@ export class MatchService implements RelayExtension {
   private bySession = new Map<string, ActiveMatch>()
   private byConn = new Map<string, ActiveMatch>()
 
-  constructor(deps: MatchDeps, store: PlayerStore, hooks: HandshakeHooks = {}) {
+  /** `store` is one PlayerStore for every game, or a GameRouter (one store per game, chosen by the game of auth / match_queue). */
+  constructor(deps: MatchDeps, store: PlayerStore | GameRouter, hooks: HandshakeHooks = {}) {
     this.deps = deps
-    this.store = store
+    this.router = 'resolve' in store ? store : singleStoreRouter(store)
     this.hooks = hooks
   }
 
   attach(hub: RelayHub): void { this.hub = hub }
+
+  /** The store of a game already validated by auth / enqueue. */
+  private storeFor(game: string): PlayerStore {
+    const backend = this.router.resolve(game)
+    if (!backend) throw new Error(`no store for game ${game}`)
+    return backend.store
+  }
 
   message(conn: string, msg: Record<string, unknown>): boolean {
     const parsed = parseMatchMessage(msg)
@@ -153,12 +164,14 @@ export class MatchService implements RelayExtension {
     }
   }
 
-  private async auth(conn: string, m: { provider: Provider; token: string; name?: string }): Promise<void> {
+  private async auth(conn: string, m: { provider: Provider; token: string; name?: string; game?: string }): Promise<void> {
     if (this.authed.has(conn)) return this.error(conn, 'already_authed')
-    const res = await resolveIdentity(m.provider, m.token, m.name, this.hooks, this.deps.log)
+    const backend = this.router.resolve(m.game)
+    if (!backend) return this.error(conn, 'bad_message')
+    const res = await resolveIdentity(m.provider, m.token, m.name, this.hooks, this.deps.log, backend.game ?? m.game)
     if (!res.ok) return this.error(conn, res.code)
-    const { player } = await st(this.store.getOrCreateByIdentity(res.identity, { display_name: res.display_name }))
-    const me = { player_id: player.player_id, display_name: player.display_name, provider: m.provider, kind: player.kind }
+    const { player } = await st(backend.store.getOrCreateByIdentity(res.identity, { display_name: res.display_name }))
+    const me = { player_id: player.player_id, display_name: player.display_name, provider: m.provider, kind: player.kind, game: backend.game }
     this.authed.set(conn, me)
     this.send(conn, { t: 'authed', player_id: me.player_id, display_name: me.display_name, provider: me.provider })
   }
@@ -167,13 +180,17 @@ export class MatchService implements RelayExtension {
     const me = this.authed.get(conn)
     if (!me) return this.error(conn, 'auth_required')
     if (me.kind === 'resident') return this.error(conn, 'resident_cannot_queue')
+    if (me.game !== null && me.game !== game) return this.error(conn, 'bad_message')
+    const backend = this.router.resolve(game)
+    if (!backend) return this.error(conn, 'bad_message')
+    if (!backend.queues().includes(queue)) return this.error(conn, 'bad_queue')
     if (this.mm.get(conn) || this.pairing.has(conn)) return this.error(conn, 'already_queued')
     if (this.byConn.has(conn) || this.hub?.seatOf(conn)) return this.error(conn, 'in_match')
     if (queue === 'ranked') {
-      const player = await st(this.store.getPlayer(me.player_id))
+      const player = await st(backend.store.getPlayer(me.player_id))
       if (player?.active_ranked_match) return this.error(conn, 'ranked_busy')
     }
-    const rating = await st(this.store.getRating(me.player_id, game))
+    const rating = await st(backend.store.getRating(me.player_id, game))
     if (this.authed.get(conn) !== me) return
     this.mm.add({ conn, player_id: me.player_id, game, queue, rating: rating.rating, since: this.deps.now() })
     this.send(conn, { t: 'match_queued', game, queue, rating: rating.rating, games: rating.games, placement: rating.placement })
@@ -221,7 +238,7 @@ export class MatchService implements RelayExtension {
     if (!hub || this.mm.get(w.conn) !== w) return seat.release()
     let player
     try {
-      player = await this.store.getPlayer(seat.player_id)
+      player = await this.storeFor(w.game).getPlayer(seat.player_id)
     } catch (err) {
       seat.release()
       this.deps.log('error', `[match] store ${new StoreFailure(err).detail} checking resident ${seat.player_id}`)
@@ -238,7 +255,7 @@ export class MatchService implements RelayExtension {
     this.mm.remove(w.conn)
     this.authed.set(rc, {
       player_id: player.player_id, display_name: player.display_name,
-      provider: player.identities[0]?.provider ?? 'guest', kind: 'resident',
+      provider: player.identities[0]?.provider ?? 'guest', kind: 'resident', game: w.game,
     })
     seat.socket.send = (frame) => hub.message(rc, frame)
     const rw: Waiter = { conn: rc, player_id: player.player_id, game: w.game, queue: w.queue, rating: w.rating, since: this.deps.now() }
@@ -302,11 +319,11 @@ export class MatchService implements RelayExtension {
     try {
       for (const w of [a, b]) {
         current = w
-        if (!(await st(this.store.lockRanked(w.player_id, matchId)))) { busy = w; break }
+        if (!(await st(this.storeFor(a.game).lockRanked(w.player_id, matchId)))) { busy = w; break }
         taken.push(w)
       }
     } catch (err) {
-      await this.unlock(taken, matchId)
+      await this.unlock(taken, matchId, a.game)
       this.deps.log('error', `[match] store ${(err as StoreFailure).detail} locking ${matchId}`)
       if (isResident(current)) {
         for (const w of [a, b]) if (!isResident(w) && this.authed.has(w.conn)) this.mm.add(w)
@@ -317,7 +334,7 @@ export class MatchService implements RelayExtension {
     }
     const alive = [a, b].filter((w) => this.authed.has(w.conn))
     if (busy || alive.length < 2) {
-      await this.unlock(taken, matchId)
+      await this.unlock(taken, matchId, a.game)
       if (busy && !isResident(busy)) this.error(busy.conn, 'ranked_busy')
       for (const w of alive) if (w !== busy && !isResident(w)) this.mm.add(w)
       return false
@@ -325,9 +342,9 @@ export class MatchService implements RelayExtension {
     return true
   }
 
-  private async unlock(taken: Waiter[], matchId: string): Promise<void> {
+  private async unlock(taken: Waiter[], matchId: string, game: string): Promise<void> {
     for (const w of taken) {
-      await this.store.unlockRanked(w.player_id, matchId).catch(() => {
+      await this.storeFor(game).unlockRanked(w.player_id, matchId).catch(() => {
         this.deps.log('error', `[match] store unlock failed for ${matchId}`)
       })
     }
@@ -370,13 +387,13 @@ export class MatchService implements RelayExtension {
     let ratings: [RatingChange, RatingChange] | null = null
     try {
       if (match.queue === 'ranked' && score_a !== null) {
-        const res = await this.store.applyRankedResult({
+        const res = await this.storeFor(match.game).applyRankedResult({
           match_id: match.match_id, game: match.game, a: match.players[0], b: match.players[1], score_a,
         })
         ratings = [res.a, res.b]
       } else if (match.queue === 'ranked') {
         for (const id of match.players) {
-          await this.store.unlockRanked(id, match.match_id).catch(() => {
+          await this.storeFor(match.game).unlockRanked(id, match.match_id).catch(() => {
             this.deps.log('error', `[match] store unlock failed for ${match.match_id}`)
           })
         }

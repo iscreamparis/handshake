@@ -1,4 +1,5 @@
 import { guestIdentity } from '../hooks.ts'
+import { ProviderNotConfiguredError } from '../identity.ts'
 import type { HandshakeHooks, VerifiedIdentity } from '../hooks.ts'
 import type { Identity, Provider } from '../store/types.ts'
 
@@ -12,12 +13,17 @@ export async function resolveIdentity(
   name: string | undefined,
   hooks: HandshakeHooks,
   log: (level: string, msg: string) => void,
+  game?: string,
 ): Promise<AuthResolution> {
   let verified: VerifiedIdentity | null
   if (hooks.verifyIdentity) {
     try {
-      verified = await hooks.verifyIdentity(provider, token, name)
-    } catch {
+      verified = await hooks.verifyIdentity(provider, token, name, game)
+    } catch (err) {
+      if (err instanceof ProviderNotConfiguredError) {
+        log('error', `[match] ${err.message}`)
+        return { ok: false, code: 'auth_unavailable' }
+      }
       log('error', `[match] verifyIdentity failed for ${provider}`)
       return { ok: false, code: 'auth_failed' }
     }

@@ -5,7 +5,8 @@
 
 import { randomUUID } from 'node:crypto'
 import { StoreError } from './errors.ts'
-import { nextRating, PLACEMENT_GAMES, START_RATING, tierOf } from './elo.ts'
+import { DEFAULT_ELO, nextRating, tierOf } from './elo.ts'
+import type { EloParams } from './elo.ts'
 import type { Filter, Row, TableApi } from './tables.ts'
 import type { OpenPackResult, PacksResult, Player, PlayerStore, RankedResult, WalletResult } from './types.ts'
 
@@ -20,9 +21,11 @@ function positiveInteger(value: number, name: string): void {
   if (!Number.isSafeInteger(value) || value <= 0) throw new StoreError('bad_argument', `Invalid ${name}`)
 }
 
-export function createHttpPlayerStore(api: TableApi, opts: { now?: () => number; uuid?: () => string } = {}): PlayerStore {
+export function createHttpPlayerStore(api: TableApi, opts: { now?: () => number; uuid?: () => string; elo?: () => EloParams } = {}): PlayerStore {
   const now = opts.now ?? Date.now
   const uuid = opts.uuid ?? randomUUID
+  /** Rating parameters of the game, read at each use so a refreshed etc_game applies without a restart. */
+  const elo = opts.elo ?? (() => DEFAULT_ELO)
   const tails = new Map<string, Promise<unknown>>()
 
   async function locked<R>(keys: string[], fn: () => Promise<R>): Promise<R> {
@@ -95,7 +98,7 @@ export function createHttpPlayerStore(api: TableApi, opts: { now?: () => number;
       filters: [{ field: 'player_id', op: 'eq', value: playerId }, { field: 'game', op: 'eq', value: game }],
       sort: [{ field: 'id', dir: 'desc' }], size: 1,
     }))[0]
-    return ev ? { rating: ev.r_after as number, games: ev.games as number } : { rating: START_RATING, games: 0 }
+    return ev ? { rating: ev.r_after as number, games: ev.games as number } : { rating: elo().start, games: 0 }
   }
 
   async function changeWallet(op: 'credit' | 'debit', playerId: string, amount: number, reason: string, txId: string): Promise<WalletResult> {
@@ -156,7 +159,7 @@ export function createHttpPlayerStore(api: TableApi, opts: { now?: () => number;
       await requirePlayer(playerId)
       stringArgument(game, 'game', 64)
       const r = await ratingOf(playerId, game)
-      return { game, ...r, placement: r.games < PLACEMENT_GAMES }
+      return { game, ...r, placement: r.games < elo().placementGames }
     },
 
     async applyRankedResult(outcome) {
@@ -176,15 +179,16 @@ export function createHttpPlayerStore(api: TableApi, opts: { now?: () => number;
       await requirePlayer(a)
       await requirePlayer(b)
       return locked([`p:${a}`, `p:${b}`], async () => {
+        const params = elo()
         const again = await stored()
         if (again) return again
         const ba = await ratingOf(a, game), bb = await ratingOf(b, game)
-        const aa = { rating: nextRating(ba.rating, bb.rating, score_a, ba.games), games: ba.games + 1 }
-        const ab = { rating: nextRating(bb.rating, ba.rating, (1 - score_a) as 0 | 0.5 | 1, bb.games), games: bb.games + 1 }
+        const aa = { rating: nextRating(ba.rating, bb.rating, score_a, ba.games, params), games: ba.games + 1 }
+        const ab = { rating: nextRating(bb.rating, ba.rating, (1 - score_a) as 0 | 0.5 | 1, bb.games, params), games: bb.games + 1 }
         const result: RankedResult = {
           match_id, game, applied: true,
-          a: { player_id: a, before: ba.rating, after: aa.rating, games: aa.games, placement: aa.games < PLACEMENT_GAMES },
-          b: { player_id: b, before: bb.rating, after: ab.rating, games: ab.games, placement: ab.games < PLACEMENT_GAMES },
+          a: { player_id: a, before: ba.rating, after: aa.rating, games: aa.games, placement: aa.games < params.placementGames },
+          b: { player_id: b, before: bb.rating, after: ab.rating, games: ab.games, placement: ab.games < params.placementGames },
         }
         const claimed = await api.insert(T.results, { match_id, result_json: JSON.stringify(result) })
         if (claimed === 'conflict') return (await stored())!
@@ -295,7 +299,7 @@ export function createHttpPlayerStore(api: TableApi, opts: { now?: () => number;
       const events = await all(T.events, [{ field: 'game', op: 'eq', value: game }], [{ field: 'id', dir: 'desc' }])
       const latest = new Map<string, { rating: number; games: number }>()
       for (const e of events) if (!latest.has(e.player_id as string)) latest.set(e.player_id as string, { rating: e.r_after as number, games: e.games as number })
-      const ranked = [...latest].filter(([, r]) => r.games >= PLACEMENT_GAMES)
+      const ranked = [...latest].filter(([, r]) => r.games >= elo().placementGames)
       const names = new Map<string, string>()
       const ids = ranked.map(([id]) => id)
       for (let i = 0; i < ids.length; i += 200) {

@@ -29,6 +29,9 @@ export const ETCITO_TABLES: Record<string, { columns: string[]; unique: string[]
   etc_ranked_results: { columns: ["match_id", "result_json"], unique: [["match_id"]] },
   etc_rating_events: { columns: ["ev_key", "player_id", "game", "match_id", "r_before", "r_after", "games"], unique: [["ev_key"]] },
   etc_ledger: { columns: ["tx_id", "player_id", "op", "game", "coin_delta", "pack_delta", "params", "result_json", "created_at"], unique: [["tx_id"]] },
+  etc_game: { columns: ["code", "name", "repo_url", "repo_branch", "handshake_game", "elo_start", "elo_k_floor", "placement_games", "queues"], unique: [["code"]] },
+  etc_publishers: { columns: ["platform", "label", "external_id", "enabled"], unique: [["platform", "external_id"]] },
+  etc_settings: { columns: ["key", "value"], unique: [["key"]] },
   etc_deploy_runs: { columns: ["run_id", "request_id", "game", "action", "artifact", "build_id", "status", "exit_code", "message", "started_at", "ended_at", "log"], unique: [["run_id"]] },
 }
 

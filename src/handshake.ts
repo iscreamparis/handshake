@@ -14,11 +14,13 @@ import { matchClaims } from './match/messages.ts'
 import { createMemoryStore } from './store/memory.ts'
 import type { HandshakeHooks } from './hooks.ts'
 import type { PlayerStore } from './store/types.ts'
+import type { GameRouter } from './store/games.ts'
 
 export interface HandshakeOptions {
   config?: Partial<Config>
   deps?: Partial<HubDeps>
-  store?: PlayerStore
+  /** One store for every game, or a GameRouter (one store per game, see createGameRouter). */
+  store?: PlayerStore | GameRouter
   hooks?: HandshakeHooks
   autoTick?: boolean
 }

@@ -2,17 +2,22 @@ import type { TierName } from './types.ts'
 
 export const START_RATING = 2500
 export const PLACEMENT_GAMES = 5
+export const K_FLOOR = 32
+
+/** Per-game rating parameters (etc_game: elo_start, elo_k_floor, placement_games). The constants above are the defaults. */
+export interface EloParams { start: number; kFloor: number; placementGames: number }
+export const DEFAULT_ELO: EloParams = { start: START_RATING, kFloor: K_FLOOR, placementGames: PLACEMENT_GAMES }
 
 export function expectedScore(r: number, rOpp: number): number {
   return 1 / (1 + 10 ** ((rOpp - r) / 400))
 }
 
-export function kFactor(gamesBefore: number): number {
-  return gamesBefore < 5 ? 160 : Math.max(32, 160 - 16 * gamesBefore)
+export function kFactor(gamesBefore: number, params: EloParams = DEFAULT_ELO): number {
+  return gamesBefore < params.placementGames ? 160 : Math.max(params.kFloor, 160 - 16 * gamesBefore)
 }
 
-export function nextRating(r: number, rOpp: number, score: 0 | 0.5 | 1, gamesBefore: number): number {
-  return Math.max(0, Math.round(r + kFactor(gamesBefore) * (score - expectedScore(r, rOpp))))
+export function nextRating(r: number, rOpp: number, score: 0 | 0.5 | 1, gamesBefore: number, params: EloParams = DEFAULT_ELO): number {
+  return Math.max(0, Math.round(r + kFactor(gamesBefore, params) * (score - expectedScore(r, rOpp))))
 }
 
 export const TIERS: readonly { name: TierName; min: number }[] = [

@@ -41,7 +41,45 @@ The `store` must implement the Promise-based `PlayerStore`: every method returns
 - `pickResident` supplies a resident opponent for a waiting ranked or quick player, or returns `null` to decline.
 - `onMatchEnd` receives the `MatchRecord` of every finished match.
 
-The relay and matchmaking hooks are wired by later milestones: in this version the hooks are stored on the instance but not yet called.
+The hooks are called by the match service: `verifyIdentity` on every `auth` (it receives the `game` of the message as a 4th argument), `pickResident` when a waiter is due for a resident (8 s quick, 15 s ranked) and `onMatchEnd` at every match end. Without `verifyIdentity`, guest tokens are verified by the built-in `guestIdentity` and the other providers answer `auth_unavailable`.
+
+## Player store: one game = one mission = one service key
+
+`store` is either one `PlayerStore` (every game name shares it: memory store, tests) or a `GameRouter` (one store per game). The standalone `npm start` chooses from the environment:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| PLAYER_STORE | `memory` | `memory` (nothing persisted) or `http` (the Etcito CRM tenant) |
+| ETCITO_URL | (required for `http`) | Base URL of the tenant, e.g. `https://<tenant-host>` (http or https, no credentials in the URL) |
+| ETCITO_GAME_KEYS | (required for `http`) | JSON object `{"<handshake_game>":"gsk_..."}`: the service key of each game |
+
+```sh
+PLAYER_STORE=http
+ETCITO_URL=https://<tenant-host>
+ETCITO_GAME_KEYS={"<handshake_game>":"gsk_...","<other_game>":"gsk_..."}
+```
+
+- A game is a CRM mission. A `gsk_` key belongs to a CRM user and the CRM routes the request to that user's ACTIVE mission, so each game needs its own service user (admin, active mission = the game's mission) and its own key. The same key for two games is refused at start-up. The names in `ETCITO_GAME_KEYS` are the `etc_game.handshake_game` values of the missions.
+- Each game has its own players: the same Wavedash user id in two games is two unrelated profiles, ratings and wallets.
+- The `game` of the messages picks the store. `auth` takes an optional `game` (1..64 chars): it is required when several games are configured, and optional (the only game is used) when there is one. A later `match_queue` must name the same game. An unknown game, a missing game with several games, or a `match_queue` for another game than the authenticated one is answered `bad_message`. A queue the game does not offer (`etc_game.queues`) is answered `bad_queue`.
+- Start-up validates the three variables (the error names the variable and never prints a key; keys are never logged) and reads each game's `etc_game` row. A key whose mission has another `etc_game.handshake_game` is a wrong-mission key and stops the start-up.
+- Game parameters come from the mission's single `etc_game` row: `elo_start` (default 2500), `elo_k_floor` (32), `placement_games` (5) and `queues` (`["quick","ranked"]`). They are read at start-up and refreshed every 60 s; a failed read, a missing row or an invalid value keeps the previous values (the defaults before the first good read), with an `error` log line. A refreshed `elo_start` applies to players with no rated match yet, the others apply to the next result. The K formula is `K = 160` while `games < placement_games`, then `max(elo_k_floor, 160 - 16 * games)`.
+- If the tenant is down at start-up the server still starts with the defaults; players then get `store_unavailable` until it answers.
+
+### Identity verification (providers)
+
+`src/identity.ts` defines `IdentityVerifier { verify(token, name, game) }` per provider, and `verifyIdentityHook(verifiers)` builds the `verifyIdentity` hook from them. `npm start` uses `defaultVerifiers()`:
+
+- `guest`: real (token of 16..128 chars; the id is its SHA-256).
+- `wavedash` and `itch`: NOT configured. They throw `ProviderNotConfiguredError` ("provider non configure"), the player gets `auth_unavailable` and the log says which provider. Nothing is trusted without a real verifier.
+
+To enable them, inject a verifier (`createHandshake({ hooks: { verifyIdentity: verifyIdentityHook(defaultVerifiers({ wavedash, itch })) } })` in an own entry point) that:
+
+- Wavedash: validates the token the client obtains from the Wavedash SDK on the SERVER side (Wavedash user-token verification endpoint and the game's credentials, held by the server, per game: the `game` argument tells which), then returns `{ provider: 'wavedash', external_id: <wavedash user id>, display_name }`. The exact endpoint and credentials come from the Wavedash developer documentation and are not assumed here.
+- itch.io: validates the player with the itch.io server API (for example an API key / OAuth token check, or the download key for the game), and returns `{ provider: 'itch', external_id: <itch user id>, display_name }`. Not specified here either; it needs a decision on what the client sends as `token`.
+- A verifier returns `null` (or throws) to refuse; an identity whose `provider` differs from the requested one is refused.
+
+Residents: `pickResident` is not set by `npm start`. Resident AI players are a separate game-agnostic service that embeds Handshake and supplies the hook; no resident is invented here.
 
 ## Store contract suite
 

@@ -85,15 +85,15 @@ runChecks([
     label: 'revision',
     run: async () => {
       const lines = contractText().split('\n').map((line) => line.replace(/\r$/, ''))
-      const header = /\(r2\)\s*$/.test(lines[0] ?? '')
+      const header = /\(r3\)\s*$/.test(lines[0] ?? '')
       const changelogStart = lines.indexOf('## Changelog')
       const changelog = changelogStart < 0 ? [] : lines.slice(changelogStart + 1)
       const end = changelog.findIndex((line) => line.startsWith('## '))
       const entries = end < 0 ? changelog : changelog.slice(0, end)
-      const r2 = entries.some((line) => line.startsWith('- r2 '))
+      const r3 = entries.some((line) => line.startsWith('- r2 ')) && entries.some((line) => line.startsWith('- r3 '))
       const r1 = entries.includes('- r1 (2026-10-12): first version.')
-      const value = `${header ? 'r2' : 'header not r2'}, ${r2 && r1 ? 'changelog ok' : `changelog r2 ${r2 ? 'ok' : 'missing'}, r1 ${r1 ? 'ok' : 'missing'}`}`
-      return { value, threshold: 'r2, changelog ok', ok: header && r1 && r2 }
+      const value = `${header ? 'r3' : 'header not r3'}, ${r3 && r1 ? 'changelog ok' : `changelog r3 ${r3 ? 'ok' : 'missing'}, r1 ${r1 ? 'ok' : 'missing'}`}`
+      return { value, threshold: 'r3, changelog ok', ok: header && r1 && r3 }
     },
   },
 ], process.argv.slice(2))

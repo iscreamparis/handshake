@@ -45,7 +45,8 @@ export interface MatchRecord {
 }
 
 export interface HandshakeHooks {
-  verifyIdentity?: (provider: Provider, token: string, name?: string) => Promise<VerifiedIdentity | null>
+  /** `game` is the game of the auth message, resolved by the router (absent with a single shared store and no game sent). */
+  verifyIdentity?: (provider: Provider, token: string, name?: string, game?: string) => Promise<VerifiedIdentity | null>
   pickResident?: (game: string, queue: QueueName, rating: number) => Promise<ResidentSeat | null>
   onMatchEnd?: (record: MatchRecord) => void | Promise<void>
 }

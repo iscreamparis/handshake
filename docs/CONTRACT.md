@@ -1,4 +1,4 @@
-# Etcito online contract (r2)
+# Etcito online contract (r3)
 
 The shared rules of the Etcito game server, Handshake, the AI residents and every game client (first: Kekkai).
 One authority: this file. A change = a new revision number + one changelog line at the bottom. Written in English.
@@ -53,8 +53,8 @@ One authority: this file. A change = a new revision number + one changelog line 
 Messages use the GameNet relay WebSocket at `/ws`, the same path as rooms. On the shared path, the first JSON text frame is routed by its `t`: relay types and the match types below go to the relay, while a rooms `hello` goes to rooms. Frames are JSON text objects with the type field `t`; errors use `{ t:'error', reason }`. A queue match pairs both players straight into a relay session on that same connection. The unchanged relay messages (`create`, `join`, `act`, `bye`, `queue`, `unqueue`, `resume`, `ping`) and their replies are documented in [docs/RELAY.md](RELAY.md). These additions are additive only: old KartRacer and GameNet clients keep working. Economy (wallet, packs) has no socket message in this revision; the host reaches it through the PlayerStore.
 
 ### Client to server
-- `auth` { provider: `wavedash` | `itch` | `guest`, token: string (guest: 16..128 chars of [A-Za-z0-9_-]; wavedash/itch: 1..4096 chars), name?: string (3..16 chars after trim; used only when the player is created) }. No auth required. Replies `authed` or error `already_authed`, `auth_failed`, `auth_unavailable`, `bad_message`, `store_unavailable` (or relay `internal`).
-- `match_queue` { game: string (1..64 chars), queue: `quick` | `ranked` }. Needs auth. Replies `match_queued`, then `match` when paired; errors `auth_required`, `already_queued`, `in_match`, `ranked_busy`, `resident_cannot_queue`, `bad_queue`, `bad_message`, `store_unavailable` (or relay `internal`). These `match_queue` / `match_unqueue` messages are distinct from the relay's legacy `queue` / `unqueue`.
+- `auth` { provider: `wavedash` | `itch` | `guest`, token: string (guest: 16..128 chars of [A-Za-z0-9_-]; wavedash/itch: 1..4096 chars), name?: string (3..16 chars after trim; used only when the player is created), game?: string (1..64 chars; the game, i.e. the mission whose player list is used) }. No auth required. Replies `authed` or error `already_authed`, `auth_failed`, `auth_unavailable`, `bad_message` (also: unknown `game`, or no `game` while several games are served), `store_unavailable` (or relay `internal`).
+- `match_queue` { game: string (1..64 chars), queue: `quick` | `ranked` }. Needs auth, and `game` must be the game the connection authenticated into (otherwise `bad_message`). Replies `match_queued`, then `match` when paired; errors `auth_required`, `already_queued`, `in_match`, `ranked_busy`, `resident_cannot_queue`, `bad_queue`, `bad_message`, `store_unavailable` (or relay `internal`). These `match_queue` / `match_unqueue` messages are distinct from the relay's legacy `queue` / `unqueue`.
 - `match_unqueue` {}. No auth required. Replies `match_unqueued`; error `not_queued` when the caller is not queued.
 - `result` { match_id: string (1..128 chars), outcome: `win` | `loss` | `draw` }. Needs auth. Replies `result_ack` { match_id } when the caller reports for a match; errors `unknown_match`, `already_reported`, `bad_message` (or relay `internal`).
 
@@ -78,7 +78,7 @@ Messages use the GameNet relay WebSocket at `/ws`, the same path as rooms. On th
 | `in_match` | This connection is already in a match. |
 | `ranked_busy` | The player already has a ranked match lock, or a lock could not be taken. |
 | `resident_cannot_queue` | A resident player cannot join a queue. |
-| `bad_queue` | Queue must be `quick` or `ranked`. |
+| `bad_queue` | Queue must be `quick` or `ranked`, and be offered by the game (`etc_game.queues`). |
 | `unknown_match` | This authenticated player is not in the named match. |
 | `already_reported` | This player already reported an outcome for the match. |
 | `store_unavailable` | A PlayerStore operation failed. |
@@ -87,6 +87,7 @@ Messages use the GameNet relay WebSocket at `/ws`, the same path as rooms. On th
 
 ### Rules
 - Auth: guest authentication is built in when there is no `verifyIdentity` hook; wavedash and itch answer `auth_unavailable` without the hook. With the hook, it decides every provider; a null result or thrown error answers `auth_failed`. Built-in guest identity hashes the token for its external id and uses a valid trimmed name, or `Guest-` plus four uppercase hash characters.
+- Games: a server that serves several games keeps one player list per game; the same provider id in two games is two unrelated players. A server serving one game (or a single shared store) accepts `auth` without `game`.
 - Quick queue pairs FIFO.
 - Ranked window is `100 + 100 * floor(wait/5000)`; pairing uses the maximum window of the two waiters. The smallest rating gap wins, then the earliest arrival; the same player is never paired with themselves.
 - Residents are offered after 8000 ms (quick) or 15000 ms (ranked) through `hooks.pickResident`; a resident never queues and is never paired with a resident.
@@ -98,3 +99,4 @@ Messages use the GameNet relay WebSocket at `/ws`, the same path as rooms. On th
 ## Changelog
 - r1 (2026-10-12): first version.
 - r2 (2026-10-14): section 7 Messages written by the Handshake project.
+- r3 (2026-10-14): `auth` gains an optional `game` (one player list per game); `bad_message` for an unknown or mismatched game; `bad_queue` also for a queue the game does not offer. Additive.

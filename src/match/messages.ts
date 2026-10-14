@@ -21,7 +21,7 @@ export type MatchServerType = typeof MATCH_SERVER_TYPES[number]
 export type MatchErrorCode = typeof MATCH_ERROR_CODES[number]
 
 export type MatchClientMessage =
-  | { t: 'auth'; provider: Provider; token: string; name?: string }
+  | { t: 'auth'; provider: Provider; token: string; name?: string; game?: string }
   | { t: 'match_queue'; game: string; queue: QueueName }
   | { t: 'match_unqueue' }
   | { t: 'result'; match_id: string; outcome: Outcome }
@@ -67,7 +67,7 @@ export function parseMatchMessage(raw: string | Record<string, unknown>): ParseM
 
   switch (type) {
     case 'auth': {
-      const { provider, token, name } = value
+      const { provider, token, name, game } = value
       if (provider !== 'wavedash' && provider !== 'itch' && provider !== 'guest') {
         return bad('auth.provider must be wavedash, itch or guest')
       }
@@ -80,11 +80,14 @@ export function parseMatchMessage(raw: string | Record<string, unknown>): ParseM
         return bad('auth.token must be 1..4096 chars')
       }
       if (name !== undefined && typeof name !== 'string') return bad('auth.name must be a string')
-      const trimmedName = name?.trim()
-      if (trimmedName !== undefined && trimmedName.length >= 3 && trimmedName.length <= 16) {
-        return { t: 'auth', provider, token, name: trimmedName }
+      if (game !== undefined && (typeof game !== 'string' || game.length < 1 || game.length > 64)) {
+        return bad('auth.game must be 1..64 chars')
       }
-      return { t: 'auth', provider, token }
+      const trimmedName = name?.trim()
+      const out: { t: 'auth'; provider: Provider; token: string; name?: string; game?: string } = { t: 'auth', provider, token }
+      if (trimmedName !== undefined && trimmedName.length >= 3 && trimmedName.length <= 16) out.name = trimmedName
+      if (game !== undefined) out.game = game
+      return out
     }
     case 'match_queue': {
       const { game, queue } = value
