@@ -246,3 +246,73 @@ test('ranked: two players 250 apart pair only once the window reaches 300 (at 10
     assert.equal(m.opponent.player_id, opp.player_id)
   }
 })
+
+/** Pairs two fresh guests on a ranked queue of `game`; returns them with their match_id. */
+async function rankedPair(game: string): Promise<[Client, Msg, Client, Msg, string]> {
+  const [a, aa] = await guest()
+  const [b, ab] = await guest()
+  for (const c of [a, b]) {
+    c.send({ t: 'match_queue', game, queue: 'ranked' })
+    const q = await c.wait((m) => m.t === 'match_queued' || m.t === 'error')
+    assert.equal(q.t, 'match_queued')
+  }
+  tick(1000)
+  const ma = await a.wait((m) => m.t === 'match')
+  const mb = await b.wait((m) => m.t === 'match')
+  assert.equal(ma.match_id, mb.match_id)
+  await a.wait((m) => m.t === 'matched')
+  await b.wait((m) => m.t === 'matched')
+  return [a, aa, b, ab, ma.match_id as string]
+}
+
+/** Round-trip probe for a matched socket: a result on an unknown match answers unknown_match, in order. */
+async function probeResult(c: Client): Promise<void> {
+  const from = c.msgs.length
+  c.send({ t: 'result', match_id: 'no-such-match', outcome: 'win' })
+  const reply = await c.wait((m) => m.t === 'error', from)
+  assert.equal(reply.reason, 'unknown_match')
+}
+
+test('result: agreeing reports update the ratings to 2580/2420 and send match_end', { skip }, async () => {
+  const game = 'e2e-result'
+  const [a, aa, b, ab, matchId] = await rankedPair(game)
+
+  a.send({ t: 'result', match_id: matchId, outcome: 'win' })
+  assert.equal((await a.wait((m) => m.t === 'result_ack' || m.t === 'error')).match_id, matchId)
+  b.send({ t: 'result', match_id: matchId, outcome: 'loss' })
+  assert.equal((await b.wait((m) => m.t === 'result_ack' || m.t === 'error')).match_id, matchId)
+
+  for (const [c, outcome, after] of [[a, 'win', 2580], [b, 'loss', 2420]] as const) {
+    const end = await c.wait((m) => m.t === 'match_end')
+    assert.equal(end.match_id, matchId)
+    assert.equal(end.status, 'complete')
+    assert.equal(end.outcome, outcome)
+    assert.equal(end.rating.before, 2500)
+    assert.equal(end.rating.after, after)
+    assert.equal(end.rating.games, 1)
+  }
+  assert.equal((await store.getRating(aa.player_id, game)).rating, 2580)
+  assert.equal((await store.getRating(ab.player_id, game)).rating, 2420)
+  assert.equal((await store.getPlayer(aa.player_id))!.active_ranked_match, null)
+  assert.equal((await store.getPlayer(ab.player_id))!.active_ranked_match, null)
+})
+
+test('forfeit: a socket closed for more than 90 s loses and the rating is applied', { skip }, async () => {
+  const game = 'e2e-forfeit'
+  const [a, aa, b, , matchId] = await rankedPair(game)
+
+  a.close()
+  await b.wait((m) => m.t === 'opp_dropped')
+
+  tick(89999)
+  await probeResult(b)
+  assert.equal(b.msgs.some((m) => m.t === 'match_end'), false, 'no match_end at 89999 ms')
+
+  tick(2)
+  const end = await b.wait((m) => m.t === 'match_end')
+  assert.equal(end.match_id, matchId)
+  assert.equal(end.status, 'forfeit')
+  assert.equal(end.outcome, 'win')
+  assert.equal(end.rating.after, 2580)
+  assert.equal((await store.getRating(aa.player_id, game)).rating, 2420)
+})
