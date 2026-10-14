@@ -15,3 +15,6 @@ export { START_RATING, PLACEMENT_GAMES, expectedScore, kFactor, nextRating, TIER
 export { RELAY_PATH } from './relay/protocol.ts'
 export { RelayHub } from './relay/hub.ts'
 export type { RelayExtension, RelaySeatRef, RelayDeps } from './relay/hub.ts'
+export { MatchService, FORFEIT_MS } from './match/service.ts'
+export { MATCH_CLIENT_TYPES, MATCH_SERVER_TYPES, MATCH_ERROR_CODES } from './match/messages.ts'
+export { rankedWindow } from './match/matchmaker.ts'

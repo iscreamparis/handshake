@@ -9,6 +9,9 @@ import { startTransport, roomsEndpoint } from './transport.ts'
 import type { Transport } from './transport.ts'
 import { RelayHub } from './relay/hub.ts'
 import { relayEndpoint } from './relay/endpoint.ts'
+import { MatchService } from './match/service.ts'
+import { matchClaims } from './match/messages.ts'
+import { createMemoryStore } from './store/memory.ts'
 import type { HandshakeHooks } from './hooks.ts'
 import type { PlayerStore } from './store/types.ts'
 
@@ -32,13 +35,16 @@ export function createHandshake(options: HandshakeOptions = {}): Handshake {
   const cfg: Config = { ...loadConfig({}), ...options.config }
   const deps: HubDeps = { ...defaultDeps(cfg), ...options.deps }
   const hub = new RoomHub(cfg, deps)
-  const relayHub = new RelayHub(deps)
+  // MatchService's public constructor takes deps, store, then hooks.
+  const match = new MatchService(deps, options.store ?? createMemoryStore(), options.hooks ?? {})
+  const relayHub = new RelayHub(deps, match)
+  match.attach(relayHub)
+  const relay = relayEndpoint(relayHub)
+  if (relay.claims) {
+    const baseClaims = relay.claims
+    relay.claims = (frame) => baseClaims(frame) || matchClaims(frame)
+  }
   const version = readVersion()
-  // Kept for the feature milestones (M3 relay, M4 matchmaking); M2 makes no store or hook call.
-  const store = options.store
-  const hooks = options.hooks
-  void store
-  void hooks
 
   let transport: Transport | null = null
   let listening = false
@@ -57,7 +63,7 @@ export function createHandshake(options: HandshakeOptions = {}): Handshake {
         transport = await startTransport({
           cfg,
           // Feature endpoints are registered here, in the composition root (ARCHITECTURE: Composition root).
-          endpoints: [roomsEndpoint(hub), relayEndpoint(relayHub)],
+          endpoints: [roomsEndpoint(hub), relay],
           health: () => {
             const { rooms, clients } = hub.stats()
             return { ok: true, rooms, clients, version }
