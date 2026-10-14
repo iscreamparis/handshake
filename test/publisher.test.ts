@@ -139,3 +139,38 @@ describe('publisher', () => {
     assert.ok((await api('/runs')).json.runs.some((r: any) => r.id === run.json.id && !('log' in r)))
   })
 })
+
+describe('publisher -> tenant mirror', () => {
+  test('every run is mirrored into etc_deploy_runs with its request id; a dead tenant never fails a run', async () => {
+    const { createMemoryTableApi } = await import('../src/store/tables.ts')
+    const dir = await mkdtemp(join(tmpdir(), 'pub-rec-'))
+    const bin = join(dir, 'wavedash')
+    await writeFile(bin, FAKE.replaceAll('__CALLS__', join(dir, 'calls.log')))
+    await chmod(bin, 0o755)
+    await mkdir(join(dir, 'home'), { recursive: true })
+    const tenant = createMemoryTableApi()
+    const mk = (recorder: typeof tenant) => createPublisher({
+      dataDir: dir, home: join(dir, 'home'), wavedashBin: bin, maxArtifactBytes: 200_000, keepArtifacts: 2, runTimeoutMs: 10_000,
+      games: { kekkai: { name: 'Kekkai', game_id: 'gid' } }, recorder,
+    })
+    const p = mk(tenant)
+    const { Readable } = await import('node:stream')
+    await p.saveArtifact('kekkai', Readable.from([await tarball({ 'index.html': 'x' })]))
+    const run = await p.startRun({ game: 'kekkai', action: 'push', request_id: 42 })
+    await p.idle()
+    const rows = tenant.rows('etc_deploy_runs')
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0]!.run_id, run.id)
+    assert.equal(rows[0]!.request_id, 42)
+    assert.equal(rows[0]!.status, 'ok')
+    assert.equal(rows[0]!.build_id, 'bld_abc123XYZ')
+    assert.match(String(rows[0]!.log), /Build ID/)
+
+    const dead = { ...tenant, insert: async () => { throw new Error('tenant down') }, update: async () => { throw new Error('tenant down') } }
+    const p2 = mk(dead as typeof tenant)
+    const run2 = await p2.startRun({ game: 'kekkai', action: 'push' })
+    await p2.idle()
+    assert.equal((await p2.getRun(run2.id))?.status, 'ok')
+    await rm(dir, { recursive: true, force: true })
+  })
+})

@@ -9,6 +9,7 @@ import { createWriteStream } from 'node:fs'
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Readable } from 'node:stream'
+import type { TableApi } from '../store/tables.ts'
 
 export interface GameConfig { name: string; game_id: string }
 export interface PublisherConfig {
@@ -20,6 +21,8 @@ export interface PublisherConfig {
   maxArtifactBytes: number
   keepArtifacts: number
   runTimeoutMs: number
+  /** Optional: mirror every run into the tenant table etc_deploy_runs (the backoffice reads it). */
+  recorder?: TableApi
 }
 export type RunStatus = 'queued' | 'running' | 'ok' | 'failed'
 export interface Run {
@@ -43,6 +46,8 @@ export interface RunRequest {
   message?: string
   title?: string
   summary?: string
+  /** id of the etc_deploy_requests row that asked for this run (set by the backoffice workflow). */
+  request_id?: number | string
 }
 export class PublisherError extends Error {
   readonly status: number
@@ -69,6 +74,33 @@ export function createPublisher(cfg: PublisherConfig) {
   const dirs = { artifacts: join(cfg.dataDir, 'artifacts'), runs: join(cfg.dataDir, 'runs'), work: join(cfg.dataDir, 'work') }
   let chain: Promise<unknown> = Promise.resolve()
   const live = new Map<string, Run>()
+  const rowIds = new Map<string, number>()
+  const requestIds = new Map<string, number | null>()
+  let recordChain: Promise<unknown> = Promise.resolve()
+
+  /** Mirror a run into the tenant. Serialised, never throws, never blocks a run: the tenant being down is not a deploy failure. */
+  function record(run: Run): void {
+    const recorder = cfg.recorder
+    if (!recorder) return
+    const done = run.status === 'ok' || run.status === 'failed'
+    const patch = { status: run.status, exit_code: run.exit_code, build_id: run.build_id, ended_at: run.ended_at, log: done ? run.log.slice(-8000) : null }
+    recordChain = recordChain.then(async () => {
+      try {
+        const id = rowIds.get(run.id)
+        if (id === undefined) {
+          const r = await recorder.insert('etc_deploy_runs', {
+            run_id: run.id, request_id: requestIds.get(run.id) ?? null, game: run.game, action: run.action,
+            artifact: run.artifact, message: run.message, started_at: run.started_at, ...patch,
+          })
+          if (r !== 'conflict') rowIds.set(run.id, r.row.id as number)
+        } else {
+          await recorder.update('etc_deploy_runs', id, patch)
+        }
+      } catch (e) {
+        console.error('[publisher] tenant record failed:', (e as Error).message)
+      }
+    })
+  }
 
   function gameOf(game: string): GameConfig {
     const g = GAME_RE.test(game) ? cfg.games[game] : undefined
@@ -200,14 +232,19 @@ export function createPublisher(cfg: PublisherConfig) {
       status: 'queued', exit_code: null, started_at: Date.now(), ended_at: null, log: '',
     }
     live.set(run.id, run)
+    const rid = Number(req.request_id)
+    requestIds.set(run.id, Number.isSafeInteger(rid) && rid > 0 ? rid : null)
     await mkdir(dirs.runs, { recursive: true })
     await persist(run)
+    record(run)
     chain = chain.then(async () => {
       run.status = 'running'
       await persist(run)
+      record(run)
       try { await execute(run, req) } catch (e) { run.status = 'failed'; run.log = clip(run.log + `\n[publisher] ${(e as Error).message}\n`) }
       run.ended_at = Date.now()
       await persist(run)
+      record(run)
     })
     return run
   }
@@ -241,7 +278,7 @@ export function createPublisher(cfg: PublisherConfig) {
     games: () => Object.entries(cfg.games).map(([id, g]) => ({ id, name: g.name })),
     listArtifacts, saveArtifact, startRun, getRun, listRuns, authStatus,
     /** Resolves when every queued run has finished (tests, graceful shutdown). */
-    idle: () => chain.then(() => undefined),
+    idle: () => chain.then(() => recordChain).then(() => undefined),
   }
 }
 export type Publisher = ReturnType<typeof createPublisher>

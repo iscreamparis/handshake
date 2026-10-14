@@ -53,6 +53,7 @@ export function createPublisherServer(publisher: Publisher, opts: { key: string 
         const body: RunRequest = {
           game: str(b.game) ?? '', action: str(b.action) as RunRequest['action'], artifact: str(b.artifact), build_id: str(b.build_id),
           message: str(b.message), title: str(b.title), summary: str(b.summary),
+          request_id: typeof b.request_id === 'number' || typeof b.request_id === 'string' ? b.request_id : undefined,
         }
         return send(res, 202, await publisher.startRun(body))
       }

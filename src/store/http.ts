@@ -95,7 +95,7 @@ export function createHttpPlayerStore(api: TableApi, opts: { now?: () => number;
       filters: [{ field: 'player_id', op: 'eq', value: playerId }, { field: 'game', op: 'eq', value: game }],
       sort: [{ field: 'id', dir: 'desc' }], size: 1,
     }))[0]
-    return ev ? { rating: ev.after as number, games: ev.games as number } : { rating: START_RATING, games: 0 }
+    return ev ? { rating: ev.r_after as number, games: ev.games as number } : { rating: START_RATING, games: 0 }
   }
 
   async function changeWallet(op: 'credit' | 'debit', playerId: string, amount: number, reason: string, txId: string): Promise<WalletResult> {
@@ -189,7 +189,7 @@ export function createHttpPlayerStore(api: TableApi, opts: { now?: () => number;
         const claimed = await api.insert(T.results, { match_id, result_json: JSON.stringify(result) })
         if (claimed === 'conflict') return (await stored())!
         for (const c of [result.a, result.b]) {
-          await api.insert(T.events, { ev_key: `${match_id}\u0000${c.player_id}`, player_id: c.player_id, game, match_id, before: c.before, after: c.after, games: c.games })
+          await api.insert(T.events, { ev_key: `${match_id}\u0000${c.player_id}`, player_id: c.player_id, game, match_id, r_before: c.before, r_after: c.after, games: c.games })
         }
         for (const id of [a, b]) {
           const lock = await one(T.locks, [{ field: 'open_key', op: 'eq', value: id }])
@@ -294,7 +294,7 @@ export function createHttpPlayerStore(api: TableApi, opts: { now?: () => number;
       positiveInteger(page, 'page')
       const events = await all(T.events, [{ field: 'game', op: 'eq', value: game }], [{ field: 'id', dir: 'desc' }])
       const latest = new Map<string, { rating: number; games: number }>()
-      for (const e of events) if (!latest.has(e.player_id as string)) latest.set(e.player_id as string, { rating: e.after as number, games: e.games as number })
+      for (const e of events) if (!latest.has(e.player_id as string)) latest.set(e.player_id as string, { rating: e.r_after as number, games: e.games as number })
       const ranked = [...latest].filter(([, r]) => r.games >= PLACEMENT_GAMES)
       const names = new Map<string, string>()
       const ids = ranked.map(([id]) => id)

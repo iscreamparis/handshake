@@ -27,8 +27,9 @@ export const ETCITO_TABLES: Record<string, { columns: string[]; unique: string[]
   etc_identities: { columns: ["ident_key", "player_id"], unique: [["ident_key"]] },
   etc_locks: { columns: ["player_id", "match_id", "open_key"], unique: [["open_key"]] },
   etc_ranked_results: { columns: ["match_id", "result_json"], unique: [["match_id"]] },
-  etc_rating_events: { columns: ["ev_key", "player_id", "game", "match_id", "before", "after", "games"], unique: [["ev_key"]] },
+  etc_rating_events: { columns: ["ev_key", "player_id", "game", "match_id", "r_before", "r_after", "games"], unique: [["ev_key"]] },
   etc_ledger: { columns: ["tx_id", "player_id", "op", "game", "coin_delta", "pack_delta", "params", "result_json", "created_at"], unique: [["tx_id"]] },
+  etc_deploy_runs: { columns: ["run_id", "request_id", "game", "action", "artifact", "build_id", "status", "exit_code", "message", "started_at", "ended_at", "log"], unique: [["run_id"]] },
 }
 
 function matches(row: Row, f: Filter): boolean {
