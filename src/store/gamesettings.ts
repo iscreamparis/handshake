@@ -12,6 +12,8 @@ export interface GameParams { elo: EloParams; queues: readonly QueueName[] }
 export const DEFAULT_GAME_PARAMS: GameParams = { elo: DEFAULT_ELO, queues: ['quick', 'ranked'] }
 
 export const REFRESH_MS = 60_000
+/** Default room ceiling of a creator game (ETCITO_CREATOR_MAX_ROOMS overrides it). */
+export const DEFAULT_CREATOR_MAX_ROOMS = 10
 
 function int(v: unknown, min: number, max: number, name: string): number {
   const n = typeof v === 'string' && v.trim() !== '' ? Number(v) : v
@@ -41,6 +43,8 @@ export type RefreshResult = 'ok' | 'no_row' | 'invalid' | 'failed' | 'mismatch'
 export interface GameSettings {
   /** Synchronous: the last good parameters (defaults until the first successful read). */
   current(): GameParams
+  maxRooms(): number | undefined
+  active(): boolean
   refresh(): Promise<RefreshResult>
   /** Starts the periodic refresh (unref'd timer). */
   start(): void
@@ -52,12 +56,23 @@ export function createGameSettings(api: TableApi, opts: {
   game: string
   intervalMs?: number
   log?: (level: string, msg: string) => void
+  /** Multi-creator mode only (ETCITO_GAME_KEYS_FILE): a mismatch disables this game until corrected. Off = today's behaviour. */
+  disableOnMismatch?: boolean
+  /** A creator game (multi-creator mode, not an owner game): handshake_game must equal the game, a missing row disables it, rooms are capped. */
+  creator?: boolean
+  /** Platform ceiling of a creator game's rooms; etc_settings limits.max_rooms may only lower it. */
+  maxRoomsCeiling?: number
 }): GameSettings {
   let params = DEFAULT_GAME_PARAMS
+  const ceiling = opts.maxRoomsCeiling ?? DEFAULT_CREATOR_MAX_ROOMS
+  let maxRooms: number | undefined = opts.creator ? ceiling : undefined
+  let active = true
   let timer: ReturnType<typeof setInterval> | null = null
   const log = opts.log ?? (() => {})
   return {
     current: () => params,
+    maxRooms: () => maxRooms,
+    active: () => active,
     async refresh() {
       let row: Row | undefined
       try {
@@ -67,19 +82,27 @@ export function createGameSettings(api: TableApi, opts: {
         return 'failed'
       }
       if (!row) {
+        if (opts.creator) active = false
         log('error', `[games] ${opts.game}: no etc_game row, keeping current parameters`)
         return 'no_row'
       }
-      if (typeof row.handshake_game === 'string' && row.handshake_game !== '' && row.handshake_game !== opts.game) {
+      if ((opts.creator && row.handshake_game !== opts.game) || (typeof row.handshake_game === 'string' && row.handshake_game !== '' && row.handshake_game !== opts.game)) {
+        if (opts.creator || opts.disableOnMismatch) active = false
         log('error', `[games] ${opts.game}: etc_game.handshake_game is "${row.handshake_game}": the service key probably belongs to another mission`)
         return 'mismatch'
       }
       try {
         params = parseGameRow(row)
+        if (opts.creator) {
+          // The creator writes its own etc_settings: the value may lower the platform ceiling, never raise it.
+          const limit = (await api.query('etc_settings', { filters: [{ field: 'key', op: 'eq', value: 'limits.max_rooms' }], size: 1 }))[0]
+          maxRooms = limit ? Math.min(int(limit.value, 0, 100000, 'limits.max_rooms'), ceiling) : ceiling
+        }
       } catch (e) {
         log('error', `[games] ${opts.game}: ${(e as Error).message}, keeping current parameters`)
         return 'invalid'
       }
+      active = true
       return 'ok'
     },
     start() {

@@ -154,7 +154,7 @@ export interface CatalogHandle {
   stop(): void
 }
 
-export function createCatalog(api: TableApi, opts: { game: string; intervalMs?: number; log?: (level: string, msg: string) => void }): CatalogHandle {
+export function createCatalog(api: TableApi, opts: { game: string; intervalMs?: number; maxBytes?: number; log?: (level: string, msg: string) => void }): CatalogHandle {
   let catalog = EMPTY_CATALOG
   let timer: ReturnType<typeof setInterval> | null = null
   const log = opts.log ?? (() => {})
@@ -170,6 +170,7 @@ export function createCatalog(api: TableApi, opts: { game: string; intervalMs?: 
       }
       if (!row || typeof row.value !== 'string' || row.value.trim() === '') return 'empty'
       try {
+        if (opts.maxBytes !== undefined && Buffer.byteLength(row.value, 'utf8') > opts.maxBytes) throw new Error('economy.catalog exceeds the platform maximum')
         catalog = parseCatalog(row.value)
       } catch (e) {
         log('error', `[economy] ${opts.game}: ${(e as Error).message}, keeping the current catalog`)

@@ -52,6 +52,9 @@ The hooks are called by the match service: `verifyIdentity` on every `auth` (it 
 | PLAYER_STORE | `memory` | `memory` (nothing persisted) or `http` (the Etcito CRM tenant) |
 | ETCITO_URL | (required for `http`) | Base URL of the tenant, e.g. `https://<tenant-host>` (http or https, no credentials in the URL) |
 | ETCITO_GAME_KEYS | (required for `http`) | JSON object `{"<handshake_game>":"gsk_..."}`: the service key of each game |
+| ETCITO_GAME_KEYS_FILE | (unset) | Multi-creator mode: path of a file holding that JSON, re-read every 30 s (replaces ETCITO_GAME_KEYS). See `docs/CREATOR_ROLLOUT.md` |
+| ETCITO_CREATOR_MAX_ROOMS | `10` | Multi-creator mode: room ceiling of a creator game |
+| ETCITO_CREATOR_STORAGE_MAX_BYTES | `52428800` | Multi-creator mode: saves + UGC quota ceiling of a creator game |
 
 ```sh
 PLAYER_STORE=http

@@ -39,6 +39,13 @@ export function createHandshake(options: HandshakeOptions = {}): Handshake {
   const cfg: Config = { ...loadConfig({}), ...options.config }
   const deps: HubDeps = { ...defaultDeps(cfg), ...options.deps }
   const hub = new RoomHub(cfg, deps)
+  if (options.store && 'resolve' in options.store) {
+    const router = options.store
+    // Only multi-creator stores refuse unknown games; otherwise any game name may open rooms, as before.
+    if (router.strictGames) hub.gameKnown = game => router.resolve(game) !== null
+    // Only creator backends carry maxRooms: owner games and single-owner mode keep the server-wide limit alone.
+    hub.maxRoomsForGame = game => router.resolve(game)?.maxRooms?.()
+  }
   // MatchService's public constructor takes deps, store, then hooks.
   const match = new MatchService(deps, options.store ?? createMemoryStore(), options.hooks ?? {})
   const relayHub = new RelayHub(deps, match)

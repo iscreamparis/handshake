@@ -1,7 +1,8 @@
 // Publisher: pushes a prebuilt game archive to Wavedash with the real `wavedash` CLI and publishes a build.
-// Credentials are the CLI's own (written once by `wavedash auth login` in the service user's HOME): this module
-// never stores, reads or refreshes them, it only runs the CLI with that HOME and reports `auth status`.
-// One run at a time (the VM is small). Commands are spawned with argument arrays, never through a shell.
+// Owner games (kekkai, monsterracer) run the CLI with the service user's HOME, as before (a stored `wavedash auth
+// login` still works for them). Creator games get a private per-run HOME + TMPDIR and must send their own token.
+// Tokens arrive per request, reach one child process and are redacted from the run log. One run at a time
+// (the VM is small). Commands are spawned with argument arrays, never through a shell.
 
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -9,14 +10,15 @@ import { createWriteStream } from 'node:fs'
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Readable } from 'node:stream'
-import type { TableApi } from '../store/tables.ts'
 import { achievementArgs, parseCreatedId, parseExisting, planCommands, portalJson, validateCatalog } from './catalog.ts'
 import type { Catalog } from './catalog.ts'
+import { isLegacyGame } from '../store/legacy.ts'
+import type { TableApi } from '../store/tables.ts'
 
 export interface GameConfig { name: string; game_id: string }
 export interface PublisherConfig {
   dataDir: string
-  /** HOME of the service user: where the wavedash CLI keeps its own credentials. */
+  /** HOME of the service user (the CLI's own stored login): used by owner-game runs and the status probes only. */
   home: string
   wavedashBin: string
   /** itch.io's `butler` (platform "itch"); default `butler`. */
@@ -26,8 +28,9 @@ export interface PublisherConfig {
   maxArtifactBytes: number
   keepArtifacts: number
   runTimeoutMs: number
-  /** Optional: mirror every run into the tenant table etc_deploy_runs (the backoffice reads it). */
+  /** Optional: mirror every OWNER-game run into the tenant table etc_deploy_runs (ETCITO_URL + ETCITO_API_KEY). */
   recorder?: TableApi
+  maxQueuedRuns?: number
 }
 export type RunStatus = 'queued' | 'running' | 'ok' | 'failed'
 export type Platform = 'wavedash' | 'itch'
@@ -114,14 +117,20 @@ function clean(s: string | undefined, max: number): string { return (s ?? '').re
 export function createPublisher(cfg: PublisherConfig) {
   const dirs = { artifacts: join(cfg.dataDir, 'artifacts'), runs: join(cfg.dataDir, 'runs'), work: join(cfg.dataDir, 'work') }
   let chain: Promise<unknown> = Promise.resolve()
+  const maxQueuedRuns = Number.isSafeInteger(cfg.maxQueuedRuns) && (cfg.maxQueuedRuns ?? 0) > 0 ? Math.min(cfg.maxQueuedRuns!, 100) : 8
+  const pending = () => [...live.values()].filter(r => r.status === 'queued' || r.status === 'running').length
+  const queueCheck = () => { if (pending() >= maxQueuedRuns) throw new PublisherError(429, 'publisher queue full') }
   const live = new Map<string, Run>()
   const rowIds = new Map<string, number>()
   let recordChain: Promise<unknown> = Promise.resolve()
 
-  /** Mirror a run into the tenant. Serialised, never throws, never blocks a run: the tenant being down is not a deploy failure. */
+  /**
+   * Mirror an OWNER run into the tenant (etc_deploy_runs of the recorder key's mission), as before. Creator runs are
+   * never mirrored: that key reads the owner's mission. Serialised, never throws, never blocks a run.
+   */
   function record(run: Run): void {
     const recorder = cfg.recorder
-    if (!recorder) return
+    if (!recorder || !isLegacyGame(run.game)) return
     const done = run.status === 'ok' || run.status === 'failed'
     const patch = { status: run.status, exit_code: run.exit_code, build_id: run.build_id, ended_at: run.ended_at, log: done ? run.log.slice(-8000) : null }
     recordChain = recordChain.then(async () => {
@@ -160,7 +169,8 @@ export function createPublisher(cfg: PublisherConfig) {
       if (!GAME_ID_RE.test(req.game_id)) throw new PublisherError(400, 'invalid game_id')
       return { name: label || cfg.games?.[req.game]?.name || req.game, game_id: req.game_id }
     }
-    const g = Object.hasOwn(cfg.games ?? {}, req.game) ? cfg.games![req.game] : undefined
+    // Static game ids are an owner migration aid only. Creator runs always carry their own target.
+    const g = (isLegacyGame(req.game) || req.game === 'kart') && Object.hasOwn(cfg.games ?? {}, req.game) ? cfg.games![req.game] : undefined
     if (!g) throw new PublisherError(400, 'unknown game')
     return { name: label || g.name, game_id: g.game_id }
   }
@@ -180,25 +190,54 @@ export function createPublisher(cfg: PublisherConfig) {
     return { BUTLER_API_KEY: key }
   }
 
-  function exec(args: string[], cwd: string, run: Run, extraEnv: Record<string, string> = {}, bin: string = cfg.wavedashBin): Promise<{ code: number | null; out: string }> {
+  function scrub(value: string, env: Record<string, string> = {}): string {
+    let clean = value
+    for (const secret of Object.values(env)) if (secret.length >= 8) clean = clean.replaceAll(secret, '[REDACTED]')
+    return clean.replace(/(x-wavedash-token|x-itch-token|authorization|wavedash_token|butler_api_key|api[_-]?key|secret|token)([\s:=]+)([^\s,;]+)/gi, '$1$2[REDACTED]')
+      .replace(/\b(?:gsk_|sk_(?:live|test)_|whsec_)[A-Za-z0-9_-]+/g, '[REDACTED]')
+  }
+  /**
+   * Owner games (kekkai, monsterracer) and the read-only status probes keep today's environment: the service user's
+   * HOME (cfg.home), where `wavedash auth login` may have stored the owner's credentials. Every other (creator) run
+   * gets a private HOME + TMPDIR under its work dir (removed with it) and only its own request token.
+   */
+  const sharedHome = (run: Run): boolean => run.game === '' || isLegacyGame(run.game)
+  async function exec(args: string[], cwd: string, run: Run, extraEnv: Record<string, string> = {}, bin: string = cfg.wavedashBin): Promise<{ code: number | null; out: string }> {
+    let env: Record<string, string>
+    if (sharedHome(run)) {
+      env = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: cfg.home, CI: '1', ...extraEnv }
+    } else {
+      // run.id is a server-made UUID: the per-run dirs never come from the request.
+      const home = join(dirs.work, run.id, 'home'), tmp = join(dirs.work, run.id, 'tmp')
+      await mkdir(home, { recursive: true, mode: 0o700 })
+      await mkdir(tmp, { recursive: true, mode: 0o700 })
+      env = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home, TMPDIR: tmp, TMP: tmp, TEMP: tmp, XDG_CONFIG_HOME: join(home, '.config'), XDG_CACHE_HOME: join(tmp, 'cache'), CI: '1', ...extraEnv }
+    }
     return new Promise(resolve => {
       let out = ''
-      const child = spawn(bin, args, {
-        cwd, shell: false,
-        env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: cfg.home, CI: '1', ...extraEnv },
-      })
+      let partial = ''
+      // The log stays live while the CLI runs (the backoffice polls it), redacted line by line.
+      const flush = (all: boolean) => {
+        const cut = all ? partial.length : Math.max(partial.lastIndexOf('\n') + 1, partial.length > 8192 ? partial.length : 0)
+        if (cut === 0) return
+        run.log = clip(run.log + scrub(partial.slice(0, cut), extraEnv))
+        partial = partial.slice(cut)
+      }
+      const child = spawn(bin, args, { cwd, shell: false, env })
       const timer = setTimeout(() => { out += '\n[publisher] timeout, killing the CLI\n'; child.kill('SIGKILL') }, cfg.runTimeoutMs)
-      const feed = (b: Buffer) => { out += b.toString('utf8'); run.log = clip(run.log + b.toString('utf8')) }
+      const feed = (b: Buffer) => { const s = b.toString('utf8'); out += s; partial += s; flush(false) }
       child.stdout.on('data', feed)
       child.stderr.on('data', feed)
-      child.on('error', e => { clearTimeout(timer); out += `\n[publisher] cannot run the CLI: ${e.message}\n`; run.log = clip(run.log + `\n[publisher] cannot run the CLI: ${e.message}\n`); resolve({ code: null, out }) })
-      child.on('close', code => { clearTimeout(timer); resolve({ code, out }) })
+      let settled = false
+      const finish = (code: number | null) => { if (settled) return; settled = true; clearTimeout(timer); flush(true); resolve({ code, out }) }
+      child.on('error', e => { const m = `\n[publisher] cannot run the CLI: ${e.message}\n`; out += m; partial += m; finish(null) })
+      child.on('close', finish)
     })
   }
   function untar(archive: string, dest: string, run: Run): Promise<number | null> {
     return new Promise(resolve => {
       const child = spawn('tar', ['-xzf', archive, '-C', dest, '--no-same-owner'], { shell: false })
-      child.stderr.on('data', (b: Buffer) => { run.log = clip(run.log + b.toString('utf8')) })
+      child.stderr.on('data', (b: Buffer) => { run.log = clip(scrub(run.log + b.toString('utf8'))) })
       child.on('error', () => resolve(null))
       child.on('close', code => resolve(code))
     })
@@ -289,6 +328,7 @@ export function createPublisher(cfg: PublisherConfig) {
     const env = tokenEnv(token)
     if (!env.WAVEDASH_TOKEN) throw new PublisherError(409, 'Wavedash API key missing (Réglage wavedash_api_token)')
     if ([...live.values()].some(r => r.game === req.game && (r.status === 'queued' || r.status === 'running'))) throw new PublisherError(409, 'a run is already in progress for this game')
+    queueCheck()
     const pid = req.publisher_id
     const run: Run = {
       id: randomUUID(), game: req.game, platform: 'wavedash', action: 'catalog', artifact: null, build_id: null, request_id: null,
@@ -304,7 +344,7 @@ export function createPublisher(cfg: PublisherConfig) {
       run.status = 'running'
       await persist(run)
       record(run)
-      try { await executeCatalog(run, catalog, game, env) } catch (e) { run.status = 'failed'; run.log = clip(run.log + `\n[publisher] ${(e as Error).message}\n`) }
+      try { await executeCatalog(run, catalog, game, env) } catch (e) { run.status = 'failed'; run.log = clip(scrub(run.log + `\n[publisher] ${(e as Error).message}\n`, env)) }
       run.ended_at = Date.now()
       await persist(run)
       record(run)
@@ -369,6 +409,8 @@ export function createPublisher(cfg: PublisherConfig) {
     if (req.platform !== undefined && req.platform !== 'itch' && req.platform !== 'wavedash') throw new PublisherError(400, 'unknown platform')
     const env = platform === 'itch' ? itchEnv(itchKey) : tokenEnv(token)
     if (platform === 'itch' && !env.BUTLER_API_KEY) throw new PublisherError(409, 'itch: API key missing (Réglage itch_api_key)')
+    // A creator run never falls back to the CLI login stored in the shared HOME: it must bring its own key.
+    if (platform === 'wavedash' && !env.WAVEDASH_TOKEN && !isLegacyGame(req.game)) throw new PublisherError(409, 'Wavedash API key missing (Réglage wavedash_api_token)')
     const game = resolveGame({ ...req, platform })
     if (req.action !== 'push' && req.action !== 'publish') throw new PublisherError(400, 'action must be push or publish')
     if (platform === 'itch' && req.action !== 'push') throw new PublisherError(400, 'itch has no separate publish: use push')
@@ -393,10 +435,11 @@ export function createPublisher(cfg: PublisherConfig) {
       if (prior) return (await getRun(prior.id)) ?? (prior as Run)
     }
     if ([...live.values()].some(r => r.game === req.game && (r.status === 'queued' || r.status === 'running'))) throw new PublisherError(409, 'a run is already in progress for this game')
+    queueCheck()
     const run: Run = {
       id: randomUUID(), game: req.game, platform, action: req.action, artifact, build_id: buildId, request_id: requestId,
       publisher_id: publisherId,
-      message: clean(req.message, 200) || `${game.name} ${new Date().toISOString().slice(0, 16)}Z`,
+      message: scrub(clean(req.message, 200), env) || `${game.name} ${new Date().toISOString().slice(0, 16)}Z`,
       status: 'queued', exit_code: null, started_at: Date.now(), ended_at: null, log: '',
     }
     live.set(run.id, run)
@@ -407,7 +450,7 @@ export function createPublisher(cfg: PublisherConfig) {
       run.status = 'running'
       await persist(run)
       record(run)
-      try { await execute(run, req, game, env) } catch (e) { run.status = 'failed'; run.log = clip(run.log + `\n[publisher] ${(e as Error).message}\n`) }
+      try { await execute(run, req, game, env) } catch (e) { run.status = 'failed'; run.log = clip(scrub(run.log + `\n[publisher] ${(e as Error).message}\n`, env)) }
       run.ended_at = Date.now()
       await persist(run)
       record(run)
@@ -432,12 +475,13 @@ export function createPublisher(cfg: PublisherConfig) {
     return runs.sort((a, b) => b.started_at - a.started_at).slice(0, limit).map(({ log: _log, ...r }) => r)
   }
 
-  /** Read-only: is the CLI logged in for this HOME? (same idea as nomorechat's claude_subscription_available) */
+  /** Read-only: is the CLI logged in for this HOME (or with this token)? Unchanged probe: the service user's HOME. */
   async function authStatus(token?: string): Promise<{ authenticated: boolean; detail: string }> {
     const probe: Run = { id: 'auth', game: '', action: 'push', artifact: null, build_id: null, request_id: null, publisher_id: null, message: '', status: 'running', exit_code: null, started_at: Date.now(), ended_at: null, log: '' }
-    const r = await exec(['auth', 'status'], cfg.dataDir, probe, tokenEnv(token))
+    const env = tokenEnv(token)
+    const r = await exec(['auth', 'status'], cfg.dataDir, probe, env)
     const text = r.out.replace(/\u001b\[[0-9;]*m/g, '').trim()
-    return { authenticated: r.code === 0 && /authenticated/i.test(text) && !/not authenticated/i.test(text), detail: text.slice(0, 300) }
+    return { authenticated: r.code === 0 && /authenticated/i.test(text) && !/not authenticated/i.test(text), detail: scrub(text, env).slice(0, 300) }
   }
 
   /** `butler status target` (read-only): needs the itch key. */
@@ -447,7 +491,7 @@ export function createPublisher(cfg: PublisherConfig) {
     if (!env.BUTLER_API_KEY) throw new PublisherError(409, 'itch: API key missing (Réglage itch_api_key)')
     const probe: Run = { id: 'itch', game: '', action: 'push', artifact: null, build_id: null, request_id: null, publisher_id: null, message: '', status: 'running', exit_code: null, started_at: Date.now(), ended_at: null, log: '' }
     const r = await exec(['status', target], cfg.dataDir, probe, env, cfg.butlerBin ?? 'butler')
-    return { ok: r.code === 0, detail: r.out.replace(/\u001b\[[0-9;]*m/g, '').trim().slice(0, 600) }
+    return { ok: r.code === 0, detail: scrub(r.out.replace(/\u001b\[[0-9;]*m/g, '').trim(), env).slice(0, 600) }
   }
 
   return {

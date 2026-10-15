@@ -80,6 +80,7 @@ export interface EconomyServiceDeps {
   rng?: Rng
   log?: (level: string, msg: string) => void
   catalogIntervalMs?: number
+  maxCatalogBytes?: number
 }
 
 const CACHE_MS = 30_000
@@ -92,7 +93,7 @@ export function createEconomyService(deps: EconomyServiceDeps): EconomyService {
   const { api, game } = deps
   const now = deps.now ?? Date.now
   const log = deps.log ?? (() => {})
-  const catalog = createCatalog(api, { game, intervalMs: deps.catalogIntervalMs, log })
+  const catalog = createCatalog(api, { game, intervalMs: deps.catalogIntervalMs, maxBytes: deps.maxCatalogBytes, log })
   const ledger: EconomyLedger = createEconomyLedger(api, { catalog: catalog.current, now, rng: deps.rng })
   const locked = createKeyedLock()
   const listeners: Array<(playerId: string) => void> = []

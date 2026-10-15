@@ -40,7 +40,7 @@ export interface HttpRoute {
   method: 'POST'
   path: string
   maxBytes?: number
-  handle(req: { body: string; headers: IncomingMessage['headers'] }): Promise<{ status: number; body?: unknown }>
+  handle(req: { body: string; headers: IncomingMessage['headers']; params?: Record<string, string> }): Promise<{ status: number; body?: unknown }>
 }
 
 export interface TransportOptions {
@@ -132,16 +132,16 @@ export async function startTransport(opts: TransportOptions): Promise<Transport>
       res.end(JSON.stringify(opts.health()))
       return
     }
-    const route = req.method === 'POST' ? opts.http?.find((r) => r.path === path) : undefined
+    const route = req.method === 'POST' ? opts.http?.find((r) => r.path === path || (r.path === '/webhooks/stripe/:game' && /^\/webhooks\/stripe\/[a-z0-9_-]{1,64}$/.test(path))) : undefined
     if (route) {
-      void serveRoute(route, req, res)
+      void serveRoute(route, req, res, route.path === '/webhooks/stripe/:game' ? { game: path.slice('/webhooks/stripe/'.length) } : undefined)
       return
     }
     res.writeHead(404, { 'content-type': 'text/plain' })
     res.end('not found')
   })
 
-  async function serveRoute(route: HttpRoute, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async function serveRoute(route: HttpRoute, req: IncomingMessage, res: ServerResponse, params?: Record<string, string>): Promise<void> {
     const max = route.maxBytes ?? 65536
     const reply = (status: number, body: unknown): void => {
       if (res.headersSent) return
@@ -163,7 +163,7 @@ export async function startTransport(opts: TransportOptions): Promise<Transport>
       if (done) return
       done = true
       clearTimeout(timer)
-      route.handle({ body: Buffer.concat(chunks).toString('utf8'), headers: req.headers }).then(
+      route.handle({ body: Buffer.concat(chunks).toString('utf8'), headers: req.headers, params }).then(
         (out) => reply(out.status, out.body),
         (e: unknown) => { opts.log('error', `[http] ${route.path}: ${e instanceof Error ? e.message : String(e)}`); reply(500, { error: 'internal' }) },
       )

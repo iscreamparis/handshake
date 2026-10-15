@@ -29,7 +29,7 @@ export const DEFAULT_LIMITS: OnlineLimits = Object.fromEntries(Object.entries(LI
 
 export interface LimitsHandle { current(): Promise<OnlineLimits> }
 
-export function createLimits(api: TableApi, now: () => number, ttlMs = 30_000): LimitsHandle {
+export function createLimits(api: TableApi, now: () => number, ttlMs = 30_000, caps?: Partial<OnlineLimits>): LimitsHandle {
   let at = -Infinity
   let value = DEFAULT_LIMITS
   return {
@@ -42,7 +42,8 @@ export function createLimits(api: TableApi, now: () => number, ttlMs = 30_000): 
       for (const [name, spec] of Object.entries(LIMIT_KEYS)) {
         const row = rows.find(r => r.key === spec.key)
         const n = row ? Number(row.value) : NaN
-        next[name] = Number.isSafeInteger(n) && n >= 0 ? n : spec.def
+        const configured = Number.isSafeInteger(n) && n >= 0 ? n : spec.def
+        next[name] = Math.min(configured, caps?.[name as keyof OnlineLimits] ?? Number.MAX_SAFE_INTEGER)
       }
       value = next as unknown as OnlineLimits
       at = now()

@@ -27,6 +27,8 @@ exit 9
 async function api(path: string, init: Omit<RequestInit, 'body'> & { auth?: boolean; body?: BodyInit | Buffer } = {}) {
   const headers = new Headers(init.headers)
   if (init.auth !== false) headers.set('authorization', `Bearer ${KEY}`)
+  // Creator (non-owner) runs must bring their own Wavedash key; owner games (kekkai) also accept it.
+  if (path === '/runs' && init.method === 'POST' && !headers.has('x-wavedash-token')) headers.set('x-wavedash-token', 'test-token-123456')
   const body = Buffer.isBuffer(init.body) ? new Uint8Array(init.body) : init.body
   const res = await fetch(base + path, { ...init, body, headers })
   return { status: res.status, json: (await res.json()) as any }
@@ -235,7 +237,7 @@ describe('publisher -> games come with the request (no games.json)', () => {
   test('no cfg.games at all: the body game_id is used, publisher_id is echoed, any valid slug takes artifacts', async () => {
     const { dir, p, up } = await setup()
     await up('mission-7_x')
-    const run = await p.startRun({ game: 'mission-7_x', game_id: GID, name: 'My Game', publisher_id: 12, action: 'push' })
+    const run = await p.startRun({ game: 'mission-7_x', game_id: GID, name: 'My Game', publisher_id: 12, action: 'push' }, 'test-token-123456')
     await p.idle()
     const done = (await p.getRun(run.id))!
     assert.equal(done.status, 'ok')
@@ -249,10 +251,10 @@ describe('publisher -> games come with the request (no games.json)', () => {
   test('refusals: invalid slug, invalid game_id, unknown game without game_id', async () => {
     const { dir, p } = await setup()
     for (const game of ['../etc', 'A', 'a b', '', 'x'.repeat(33)])
-      await assert.rejects(p.startRun({ game, game_id: GID, action: 'push' }), /invalid game slug/)
+      await assert.rejects(p.startRun({ game, game_id: GID, action: 'push' }, 'test-token-123456'), /invalid game slug/)
     for (const game_id of ['short', 'bad id!!!!!', 'a'.repeat(65), 'gid_with_underscore'])
-      await assert.rejects(p.startRun({ game: 'ok', game_id, action: 'push' }), /invalid game_id/)
-    await assert.rejects(p.startRun({ game: 'ok', action: 'push' }), /unknown game/)
+      await assert.rejects(p.startRun({ game: 'ok', game_id, action: 'push' }, 'test-token-123456'), /invalid game_id/)
+    await assert.rejects(p.startRun({ game: 'ok', action: 'push' }, 'test-token-123456'), /unknown game/)
     await assert.rejects(p.saveArtifact('../x', (await import('node:stream')).Readable.from([Buffer.from('a')])), /invalid game slug/)
     await rm(dir, { recursive: true, force: true })
   })

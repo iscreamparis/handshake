@@ -67,6 +67,17 @@ if [ ! -f "$ENVFILE" ]; then
   chmod 640 "$ENVFILE"
 fi
 
+# The CRM bridge reads this file when its app setting is empty. Keep it in sync with the service key.
+KEYFILE=/etc/etcito-publisher.key
+if [ ! -f "$KEYFILE" ]; then
+  key="$(sed -n 's/^PUBLISHER_KEY=//p' "$ENVFILE" | head -n 1)"
+  [ -n "$key" ] || { echo "PUBLISHER_KEY missing from $ENVFILE" >&2; exit 1; }
+  umask 077
+  printf '%s\n' "$key" > "$KEYFILE"
+  chown root:etcito "$KEYFILE"
+  chmod 640 "$KEYFILE"
+fi
+
 install -m 644 "$HERE/etcito-publisher.service" /etc/systemd/system/etcito-publisher.service
 systemctl daemon-reload
 systemctl enable --now etcito-handshake-update.path >/dev/null 2>&1 || true

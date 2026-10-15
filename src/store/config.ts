@@ -1,9 +1,11 @@
 // Player store selection from the environment. Nothing is hardcoded: games and keys come from
 // ETCITO_GAME_KEYS. Errors name the variable, never its value (the keys are secrets).
 
+import { readFileSync } from 'node:fs'
+
 export type StoreConfig =
   | { mode: 'memory' }
-  | { mode: 'http'; baseUrl: string; games: Record<string, string> }
+  | { mode: 'http'; baseUrl: string; games: Record<string, string>; keyFile?: string }
 
 function fail(name: string, why: string): never {
   throw new Error(`[config] ${name}: ${why}`)
@@ -21,7 +23,11 @@ export function loadStoreConfig(env: Record<string, string | undefined>): StoreC
   if (url.protocol !== 'https:' && url.protocol !== 'http:') fail('ETCITO_URL', 'must be http(s)')
   if (url.username !== '' || url.password !== '') fail('ETCITO_URL', 'must not embed credentials')
 
-  const rawKeys = env.ETCITO_GAME_KEYS
+  const keyFile = env.ETCITO_GAME_KEYS_FILE?.trim()
+  let rawKeys = env.ETCITO_GAME_KEYS
+  if (keyFile) {
+    try { rawKeys = readFileSync(keyFile, 'utf8') } catch { fail('ETCITO_GAME_KEYS_FILE', 'unreadable') }
+  }
   if (rawKeys === undefined || rawKeys.trim() === '') fail('ETCITO_GAME_KEYS', 'required when PLAYER_STORE=http (JSON object {"<game>":"gsk_..."})')
   let parsed: unknown
   // JSON.parse messages quote the input: never forward them.
@@ -39,5 +45,5 @@ export function loadStoreConfig(env: Record<string, string | undefined>): StoreC
     seen.add(key)
     games[game] = key
   }
-  return { mode: 'http', baseUrl: rawUrl, games }
+  return { mode: 'http', baseUrl: rawUrl, games, ...(keyFile ? { keyFile } : {}) }
 }

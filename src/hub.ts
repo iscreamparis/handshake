@@ -48,6 +48,8 @@ export class RoomHub {
   clients = new Map<string, Client>()
   rooms = new Map<string, Room>()
   counter = 0
+  maxRoomsForGame?: (game: string) => number | undefined
+  gameKnown?: (game: string) => boolean
 
   constructor(cfg: Config, deps: HubDeps) {
     this.cfg = cfg
@@ -134,6 +136,7 @@ export class RoomHub {
         this.closeClient(c, 4001, 'bad_version')
         return
       }
+      if (this.gameKnown && !this.gameKnown(m.game)) return this.error(c, 'bad_message', 'unknown game', m.rid)
       c.hello = true
       c.game = m.game
       c.name = m.name
@@ -213,7 +216,10 @@ export class RoomHub {
 
   private onCreate(c: Client, players: LocalPlayer[], settings: RoomSettings | undefined, isPrivate: boolean, r: Rid | undefined, now: number): void {
     if (c.room) return this.error(c, 'already_in_room', 'already in a room', r)
+    if (this.gameKnown && !this.gameKnown(c.game)) return this.error(c, 'bad_message', 'unknown game', r)
     if (this.rooms.size >= this.cfg.maxRooms) return this.error(c, 'server_full', 'no room available on this server', r)
+    const gameCap = this.maxRoomsForGame?.(c.game)
+    if (gameCap !== undefined && [...this.rooms.values()].filter(room => room.game === c.game).length >= gameCap) return this.error(c, 'server_full', 'no room available for this game', r)
     const code = generateRoomCode(this.deps.random, (k) => this.rooms.has(k))
     const room: Room = {
       code, game: c.game, owner: 0, status: 'lobby', settings: { ...(settings ?? DEFAULT_SETTINGS) },
