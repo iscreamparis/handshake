@@ -14,7 +14,7 @@ import { StoreError } from '../store/errors.ts'
 import type { Filter, Row, TableApi } from '../store/tables.ts'
 import { createKeyedLock } from './lock.ts'
 import { findReward } from './catalog.ts'
-import { cryptoRng, drawRandom, fixedCards } from './draw.ts'
+import { cryptoRng, drawRandom, fixedCards, shopPool } from './draw.ts'
 import type { Rng } from './draw.ts'
 import type { BuyResult, Catalog, DrawnCard, EconomyState, Fx, OpenResult, OpResult, Product, RewardResult } from './types.ts'
 
@@ -227,7 +227,7 @@ export function createEconomyLedger(api: TableApi, opts: {
       return run(playerId, `c:${playerId}:${opId}`, 'eco.open', [packType], state => {
         if ((state.packs[packType] ?? 0) < 1) throw new StoreError('no_packs', 'No unopened pack of this type')
         const owned = new Set(Object.keys(state.cards))
-        const pool = catalog.cards.filter(c => c.token !== true)
+        const pool = shopPool(catalog.cards)
         const cards: DrawnCard[] = def.kind === 'fixed'
           ? fixedCards(def, new Map(catalog.cards.map(c => [c.id, c])), owned)
           : drawRandom(def, rng, pool, owned)
