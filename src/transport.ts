@@ -1,5 +1,6 @@
 // node:http + ws transport: /health, upgrades, heartbeat and endpoint ticks.
 
+import { originAllowed } from './origin.ts'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Duplex } from 'node:stream'
@@ -172,7 +173,7 @@ export async function startTransport(opts: TransportOptions): Promise<Transport>
   server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     const path = (req.url ?? '/').split('?')[0]
     const origin = req.headers.origin
-    const originOk = cfg.allowedOrigins.length === 0 || (typeof origin === 'string' && cfg.allowedOrigins.includes(origin))
+    const originOk = originAllowed(cfg.allowedOrigins, origin)
     const group = groups.get(path)
     if (!group || !originOk) {
       socket.on('error', () => {})
