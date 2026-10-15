@@ -99,5 +99,7 @@ export function economyRoutes(opts: { backends: () => GameBackend[]; log?: (leve
       }
     },
   }
-  return [wavedash, stripe]
+  // Wavedash sends playtest purchases to a second URL; same handler: the signed receipt carries its env, and a
+  // PLAYTEST receipt is only accepted when the setting economy.allow_playtest is on (service.ts).
+  return [wavedash, { ...wavedash, path: '/webhooks/wavedash/playtest' }, stripe]
 }

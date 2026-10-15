@@ -15,3 +15,9 @@ test('exact, wildcard, and rejections', () => {
   assert.equal(originAllowed(A, undefined), false)
   assert.equal(originAllowed(A, 'null'), false)
 })
+
+import { economyRoutes } from '../src/economy/routes.ts'
+test('wavedash webhook is served on the production and the playtest URL', () => {
+  const paths = economyRoutes({ backends: () => [] }).map(r => r.path)
+  assert.deepEqual(paths, ['/webhooks/wavedash', '/webhooks/wavedash/playtest', '/webhooks/stripe'])
+})
