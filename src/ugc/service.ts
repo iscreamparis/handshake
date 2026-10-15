@@ -65,7 +65,7 @@ const meta = (r: Row): UgcMeta => ({
   description: String(r.description ?? ''), visibility: String(r.visibility) as Visibility, content_type: String(r.content_type) as ContentType,
   size: num(r.size), hash: String(r.hash ?? ''), version: num(r.version),
   wavedash_ref: typeof r.wavedash_ref === 'string' && r.wavedash_ref !== '' ? r.wavedash_ref : null,
-  hidden: r.hidden === true, created_at: num(r.created_at), updated_at: num(r.updated_at),
+  hidden: r.hidden === true, created_at: num(r.created_at) || num(r.updated_at), updated_at: num(r.updated_at),
 })
 const isDeleted = (r: Row): boolean => r.content_type === DELETED
 
@@ -145,7 +145,9 @@ export function createUgcService(deps: { api: TableApi; limits: LimitsHandle; no
           if (prior && prior.player_id === playerId) return { item: meta(prior), applied: false }
           throw new StoreError('tx_conflict', 'Item id already used')
         }
-        return { item: meta(made.row), applied: true }
+        // the generic table API drops created_at / updated_at on insert (system columns): stamp updated_at with an update
+        await api.update('etc_ugc', made.row.id as number, { updated_at: t })
+        return { item: meta({ ...made.row, created_at: t, updated_at: t }), applied: true }
       })
     },
 

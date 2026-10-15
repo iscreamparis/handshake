@@ -146,8 +146,12 @@ export function createProgressService(deps: { api: TableApi; now?: () => number;
         await api.update('etc_player_stats', row.id as number, { value: next, updated_at: now() })
         return { value: next, changed: true }
       }
-      const made = await api.insert('etc_player_stats', { player_id: playerId, stat_code: def.code, value: next, updated_at: now() })
-      if (made !== 'conflict') return { value: next, changed: true }
+      const t = now()
+      const made = await api.insert('etc_player_stats', { player_id: playerId, stat_code: def.code, value: next, updated_at: t })
+      if (made !== 'conflict') {
+        await api.update('etc_player_stats', made.row.id as number, { updated_at: t }) // insert drops the system column updated_at
+        return { value: next, changed: true }
+      }
     }
     throw new Error('stat row race')
   }

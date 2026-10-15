@@ -105,7 +105,9 @@ export function createSavesService(deps: { api: TableApi; limits: LimitsHandle; 
             const r = await find(playerId, key)
             throw new StoreError('version_conflict', 'Server version differs', r && !isTomb(r) ? full(r) : null)
           }
-          return { save: meta(made.row), applied: true }
+          // the generic table API drops created_at / updated_at on insert (system columns): stamp updated_at with an update
+          await api.update('etc_saves', made.row.id as number, { updated_at: t })
+          return { save: { key, version: 1, etag, size, updated_at: t }, applied: true }
         }
         const version = num(row.version) + 1
         await api.update('etc_saves', row.id as number, { version, etag, size, data, updated_at: t })
