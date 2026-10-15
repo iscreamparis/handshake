@@ -18,7 +18,9 @@ export interface Product {
   active: boolean
 }
 
-export interface CardDef { id: string; rarity: string; token?: boolean }
+/** `source` is the catalog's provenance tag: 'base' (starter decks) and 'story' (story packs) cards never come out of a
+ *  random (shop) pack; absent or any other value = shop-eligible. Tokens are never drawn either. */
+export interface CardDef { id: string; rarity: string; token?: boolean; source?: string }
 
 /** `random`: tiered draw of `size` cards (rules below). `fixed`: exactly these cards (story rewards). */
 export interface PackDef {

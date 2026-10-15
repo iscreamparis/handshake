@@ -85,7 +85,8 @@ export function parseCatalog(text: string | null | undefined): Catalog {
     if (typeof id !== 'string' || !ID_RE.test(id) || typeof o?.rarity !== 'string' || !ID_RE.test(o.rarity)) throw new Error('economy.catalog.cards: each card needs an id and a rarity')
     if (seen.has(id)) throw new Error(`economy.catalog.cards: duplicate id ${id}`)
     seen.add(id)
-    cards.push({ id, rarity: o.rarity, ...(o.token === true ? { token: true } : {}) })
+    if (o.source !== undefined && (typeof o.source !== 'string' || !ID_RE.test(o.source))) throw new Error(`economy.catalog.cards: bad source on card ${id}`)
+    cards.push({ id, rarity: o.rarity, ...(o.token === true ? { token: true } : {}), ...(typeof o.source === 'string' ? { source: o.source } : {}) })
   }
   const packs: Record<string, PackDef> = {}
   if (raw.packs !== undefined) {

@@ -19,6 +19,11 @@ function pickOne<T>(rng: Rng, arr: readonly T[]): T {
   return arr[Math.floor(rng() * arr.length)]!
 }
 
+/** Cards a `random` (shop) pack may contain: no tokens, and none tagged `source` 'base' or 'story'. */
+export function shopPool(cards: readonly CardDef[]): CardDef[] {
+  return cards.filter(c => c.token !== true && c.source !== 'base' && c.source !== 'story')
+}
+
 /** Draws the cards of a `random` pack. `pool` is the catalog without tokens; `owned` the card ids the player holds. */
 export function drawRandom(def: PackDef, rng: Rng, pool: readonly CardDef[], owned: ReadonlySet<string>): DrawnCard[] {
   if (pool.length === 0) return []
