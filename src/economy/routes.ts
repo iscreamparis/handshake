@@ -75,7 +75,11 @@ export function economyRoutes(opts: { backends: () => GameBackend[]; log?: (leve
       const type = event.type
       const data = event.data
       const obj = isObj(data) && isObj(data.object) ? data.object : null
-      if (!obj) return { status: 200, body: { ok: true, ignored: 'no object' } }
+      if (!obj) {
+        // A "thin" event destination sends no data.object (only related_object): nothing to grant from. Say so loudly.
+        log('error', `[webhook] stripe ${String(type)} has no data.object (payload style must be Snapshot, not Thin); keys: ${Object.keys(event).join(',')}`)
+        return { status: 200, body: { ok: true, ignored: 'no object' } }
+      }
       try {
         if (type === 'checkout.session.completed' || type === 'checkout.session.async_payment_succeeded') {
           const game = isObj(obj.metadata) && typeof obj.metadata.game === 'string' ? obj.metadata.game : null
