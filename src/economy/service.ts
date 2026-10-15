@@ -45,7 +45,10 @@ export interface EconomyService {
   readonly game: string
   readonly catalog: CatalogHandle
   state(playerId: string): Promise<EconomyView>
-  products(): Promise<ProductView[]>
+  /** The active products; a player under a purchase ban sees none that costs real money. */
+  products(playerId?: string): Promise<ProductView[]>
+  /** Epoch ms until which this player may not buy with real money (after a refund), or null. */
+  purchaseBlockedUntil(playerId: string): Promise<number | null>
   reward(playerId: string, rewardId: string): Promise<OpResult<RewardResult>>
   buy(playerId: string, opId: string, productCode: string, qty: number): Promise<OpResult<BuyResult>>
   open(playerId: string, opId: string, packType: string): Promise<OpResult<OpenResult>>
@@ -81,6 +84,9 @@ export interface EconomyServiceDeps {
 
 const CACHE_MS = 30_000
 const SETTING_ALLOW_PLAYTEST = 'economy.allow_playtest'
+const SETTING_REFUND_BAN_DAYS = 'economy.refund_ban_days'
+const DEFAULT_REFUND_BAN_DAYS = 30
+const DAY_MS = 86_400_000
 
 export function createEconomyService(deps: EconomyServiceDeps): EconomyService {
   const { api, game } = deps
@@ -120,6 +126,32 @@ export function createEconomyService(deps: EconomyServiceDeps): EconomyService {
       const row = await one('etc_settings', [eq('key', SETTING_ALLOW_PLAYTEST)])
       return row?.value === '1' || row?.value === 'true'
     })
+  }
+
+  // --- refund sanction -----------------------------------------------------------------------------------------
+
+  async function refundBanDays(): Promise<number> {
+    const row = await one('etc_settings', [eq('key', SETTING_REFUND_BAN_DAYS)])
+    const n = row ? Number(row.value) : NaN
+    return Number.isFinite(n) && n >= 0 ? n : DEFAULT_REFUND_BAN_DAYS
+  }
+
+  async function blockedUntil(playerId: string): Promise<number | null> {
+    let rows: Row[]
+    try { rows = await api.query('etc_purchase_bans', { filters: [eq('player_id', playerId), { field: 'until', op: 'gt', value: now() }], size: 50 }) }
+    catch { log('error', `[economy] ${game}: etc_purchase_bans is not readable (apply the ERD): no ban enforced`); return null }
+    let max = 0
+    for (const r of rows) max = Math.max(max, Number(r.until) || 0)
+    return max > 0 ? max : null
+  }
+
+  /** A refund costs the player the right to buy with real money for economy.refund_ban_days days (0 = no ban). */
+  async function banAfterRefund(playerId: string, ref: string): Promise<void> {
+    const days = await refundBanDays()
+    if (days <= 0) return
+    // Never let the sanction break the refund itself (the webhook would retry a refund that is already applied).
+    try { await api.insert('etc_purchase_bans', { player_id: playerId, until: now() + days * DAY_MS, reason: 'refund', purchase_ref: ref, created_at: now() }) }
+    catch { log('error', `[economy] ${game}: could not record the purchase ban of ${playerId} (${ref}): apply the ERD`) }
   }
 
   // --- purchases ---------------------------------------------------------------------------------------------
@@ -163,6 +195,7 @@ export function createEconomyService(deps: EconomyServiceDeps): EconomyService {
       if (!row) {
         if (!fallback) return
         await api.insert('etc_purchases', { provider, external_id: externalId, player_id: fallback.player_id, product_code: fallback.product_code, status: 'refunded', created_at: now(), refunded_at: now() })
+        await banAfterRefund(fallback.player_id, `${provider}:${externalId}`)
         return
       }
       if (row.status === 'refunded') return
@@ -172,6 +205,7 @@ export function createEconomyService(deps: EconomyServiceDeps): EconomyService {
         notify(playerId)
       }
       await api.update('etc_purchases', row.id as number, { status: 'refunded', refunded_at: now() })
+      await banAfterRefund(playerId, `${provider}:${externalId}`)
     })
   }
 
@@ -206,12 +240,15 @@ export function createEconomyService(deps: EconomyServiceDeps): EconomyService {
       return { coins: s.coins, version: s.version, packs: Object.entries(s.packs).map(([pack_type, quantity]) => ({ pack_type, quantity })), cards: s.cards }
     },
 
-    async products() {
+    purchaseBlockedUntil: (playerId) => blockedUntil(playerId),
+
+    async products(playerId) {
+      const blocked = playerId ? (await blockedUntil(playerId)) !== null : false
       const rows = await api.query('etc_products', { filters: [eq('active', true)], sort: [{ field: 'sort_order', dir: 'asc' }, { field: 'id', dir: 'asc' }], size: 200 })
       const out: ProductView[] = []
       for (const r of rows) {
         const p = parseProduct(r)
-        if (p && p.active) out.push({ provider: p.provider, code: p.code, label: p.label, description: typeof r.description === 'string' ? r.description : '', price: p.price, currency: p.currency, grant_coins: p.grant_coins, grant_packs: p.grant_packs })
+        if (p && p.active && !(blocked && p.provider !== 'coins')) out.push({ provider: p.provider, code: p.code, label: p.label, description: typeof r.description === 'string' ? r.description : '', price: p.price, currency: p.currency, grant_coins: p.grant_coins, grant_packs: p.grant_packs })
       }
       return out
     },
@@ -257,6 +294,8 @@ export function createEconomyService(deps: EconomyServiceDeps): EconomyService {
 
     async stripeCheckout(playerId, productCode, returnUrl) {
       if (!deps.stripe) throw new EconomyUnavailable('stripe')
+      const until = await blockedUntil(playerId)
+      if (until !== null) throw new StoreError('purchases_blocked', String(until))
       const product = await findProduct('stripe', productCode)
       if (!product) throw new StoreError('unknown_product', 'Unknown product')
       const sep = returnUrl.includes('?') ? '&' : '?'

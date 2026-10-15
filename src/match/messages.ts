@@ -14,7 +14,7 @@ export const MATCH_ERROR_CODES = [
   'resident_cannot_queue', 'bad_queue', 'unknown_match', 'already_reported',
   'store_unavailable',
   'economy_unavailable', 'insufficient_funds', 'no_packs', 'tx_conflict', 'unknown_product', 'unknown_reward', 'unknown_pack',
-  'purchase_refunded', 'bad_receipt', 'receipt_mismatch', 'not_production', 'bad_return_url', 'payment_unavailable',
+  'purchase_refunded', 'purchases_blocked', 'bad_receipt', 'receipt_mismatch', 'not_production', 'bad_return_url', 'payment_unavailable',
   ...ONLINE_ERROR_CODES,
 ] as const
 

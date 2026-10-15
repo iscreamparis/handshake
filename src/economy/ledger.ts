@@ -30,8 +30,10 @@ export interface EconomyLedger {
   openPack(playerId: string, opId: string, packType: string): Promise<OpResult<OpenResult>>
   /** Credits what a paid product contains. `txId` is the idempotency key (e.g. `wd:<purchaseId>`). */
   grantProduct(playerId: string, txId: string, product: Product): Promise<OpResult<{ coins: number; packs: Record<string, number> }>>
-  /** Takes back the coins and the unopened packs granted by `originalTxId` (opened cards are kept). */
-  reverse(playerId: string, txId: string, originalTxId: string): Promise<OpResult<{ coins: number; packs: Record<string, number> }>>
+  /** Claws back what `originalTxId` (a refunded purchase) gave: its coins, then its closed packs; whatever was already
+   *  spent is recovered from the player's later pack purchases (closed packs first, then the cards drawn from the newest
+   *  openings). Never goes below zero; cards are removed whole copies at a time. */
+  reverse(playerId: string, txId: string, originalTxId: string): Promise<OpResult<{ coins: number; packs: Record<string, number>; cards: Record<string, number> }>>
   /** The ledger fx of an earlier operation, or null. */
   grantedBy(txId: string): Promise<Fx | null>
 }
@@ -252,14 +254,73 @@ export function createEconomyLedger(api: TableApi, opts: {
       arg(originalTxId, 'original transaction id', 200)
       return run(playerId, txId, 'eco.reverse', [originalTxId], async state => {
         const original = await one(T.ledger, [eq('tx_id', originalTxId)])
-        const fx = original && original.player_id === playerId ? fxOf(original) : emptyFx()
+        const mine = original && original.player_id === playerId
+        const fx = mine ? fxOf(original) : emptyFx()
+        const origId = mine ? num(original.id) : 0
+        const left = { ...state.packs }
+        const cardsLeft = { ...state.cards }
         const packs: Record<string, number> = {}
-        for (const [t, n] of Object.entries(fx.packs)) {
-          // Only what is still closed can be taken back.
-          const take = Math.min(n, state.packs[t] ?? 0)
-          if (take > 0) packs[t] = -take
+        const cards: Record<string, number> = {}
+        const owedOpened: Record<string, number> = {}   // packs that must be recovered from what was opened
+        const takePacks = (type: string, n: number): number => {
+          const take = Math.min(n, left[type] ?? 0)
+          if (take > 0) { packs[type] = (packs[type] ?? 0) - take; left[type] = (left[type] ?? 0) - take }
+          return take
         }
-        return { fx: { coins: -fx.coins, packs, cards: {} }, result: { coins: -fx.coins, packs } }
+
+        // 1. the coins of the purchase, as far as they are still there
+        const coins = Math.min(Math.max(0, fx.coins), state.coins)
+        let shortfall = Math.max(0, fx.coins) - coins   // coins already spent
+
+        // 2. the packs of the purchase: closed ones are taken, opened ones are owed
+        for (const [t, n] of Object.entries(fx.packs)) {
+          const taken = takePacks(t, n)
+          if (n - taken > 0) owedOpened[t] = (owedOpened[t] ?? 0) + (n - taken)
+        }
+
+        if (origId > 0 && (shortfall > 0 || Object.keys(owedOpened).length > 0)) {
+          const after = (op: string) => all(T.ledger, [eq('player_id', playerId), eq('op', op), { field: 'id', op: 'gt', value: origId }])
+          const newest = (rows: Row[]) => rows.sort((a, b) => num(b.id) - num(a.id))
+
+          // 3. coins already spent: undo the player's later pack purchases, newest first
+          if (shortfall > 0) {
+            for (const row of newest(await after('eco.buy'))) {
+              if (shortfall <= 0) break
+              const bfx = fxOf(row)
+              const total = Object.values(bfx.packs).reduce((a, b) => a + Math.max(0, b), 0)
+              const spent = -num(row.coin_delta)
+              if (total <= 0 || spent <= 0) continue
+              const perPack = spent / total
+              for (const [t, k] of Object.entries(bfx.packs)) {
+                if (shortfall <= 0 || k <= 0) continue
+                const want = Math.min(k, Math.ceil(shortfall / perPack))
+                const taken = takePacks(t, want)
+                if (want - taken > 0) owedOpened[t] = (owedOpened[t] ?? 0) + (want - taken)
+                shortfall -= want * perPack
+              }
+            }
+          }
+
+          // 4. packs that were opened: remove the cards of the newest openings of that type
+          if (Object.keys(owedOpened).length > 0) {
+            const opens = newest(await after('eco.open'))
+            for (const [t, n0] of Object.entries(owedOpened)) {
+              let n = n0
+              for (const row of opens) {
+                if (n <= 0) break
+                let type: unknown
+                try { type = (JSON.parse(row.params as string) as unknown[])[0] } catch { type = undefined }
+                if (type !== t) continue
+                n--
+                for (const [card, c] of Object.entries(fxOf(row).cards)) {
+                  const rm = Math.min(Math.max(0, c), cardsLeft[card] ?? 0)
+                  if (rm > 0) { cards[card] = (cards[card] ?? 0) - rm; cardsLeft[card] = (cardsLeft[card] ?? 0) - rm }
+                }
+              }
+            }
+          }
+        }
+        return { fx: { coins: -coins, packs, cards }, result: { coins: -coins, packs, cards } }
       })
     },
 

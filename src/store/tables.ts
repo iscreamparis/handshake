@@ -44,6 +44,7 @@ export const ETCITO_TABLES: Record<string, { columns: string[]; unique: string[]
   etc_achievements: { columns: ["code", "title_fr", "title_en", "description_fr", "description_en", "secret", "image", "rule_type", "rule_stat", "rule_threshold", "rule_event", "rule_filter", "active", "sort_order", "created_at"], unique: [["code"]] },
   etc_player_achievements: { columns: ["player_id", "achievement_code", "unlocked_at", "synced_wavedash_at", "source"], unique: [["player_id", "achievement_code"]] },
   etc_ugc: { columns: ["item_id", "player_id", "ugc_type", "title", "description", "visibility", "hidden", "content_type", "content", "size", "hash", "version", "wavedash_ref", "created_at", "updated_at"], unique: [["item_id"]] },
+  etc_purchase_bans: { columns: ["player_id", "until", "reason", "purchase_ref", "created_at"], unique: [] },
   etc_deploy_runs: { columns: ["run_id", "request_id", "game", "action", "artifact", "build_id", "status", "exit_code", "message", "started_at", "ended_at", "log"], unique: [["run_id"]] },
 }
 

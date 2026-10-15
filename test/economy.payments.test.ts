@@ -183,7 +183,7 @@ test('webhook: bad receipts are refused, a missing product is retried (409), ful
   assert.equal((await r.svc.state(buyer)).coins, 250)                                                   // the retry does not grant again
 })
 
-test('refund: coins and closed packs are taken back, opened cards are kept; the purchase is marked', async () => {
+test('refund: coins, closed packs and the cards of opened packs are taken back; the purchase is marked', async () => {
   const { signer, r, player } = await wdRig()
   const hook = routes(r)
   await hook.wavedash(receipt(signer, { purchaseId: 'b1', contentIdentifier: 'bundle' }))   // 100 coins + 2 packs
@@ -192,7 +192,7 @@ test('refund: coins and closed packs are taken back, opened cards are kept; the 
   const s = await r.svc.state(player)
   assert.equal(s.coins, opened.result.refund)   // the 100 coins are gone; only the duplicate refund of the opened pack remains
   assert.deepEqual(s.packs, [])   // the second, still closed, pack was taken back
-  assert.ok(Object.keys(s.cards).length > 0)
+  assert.deepEqual(s.cards, {})   // the opened pack came with the refunded purchase: its cards go too
   assert.equal(r.api.rows('etc_purchases')[0]!.status, 'refunded')
   // delivering the refund twice, or the completed event again after it, changes nothing
   await hook.wavedash(receipt(signer, { purchaseId: 'b1', contentIdentifier: 'bundle', event: 'purchase.refunded' }))
@@ -201,14 +201,16 @@ test('refund: coins and closed packs are taken back, opened cards are kept; the 
   assert.deepEqual((await r.svc.state(player)).packs, [])
 })
 
-test('refund coins may leave a negative balance that blocks spending until repaid', async () => {
+test('refund of coins already spent on packs: the packs bought afterwards are taken back, the balance never goes negative', async () => {
   const { signer, r, player } = await wdRig()
   const hook = routes(r)
   await hook.wavedash(receipt(signer, { purchaseId: 'c1' }))                    // +250
   await r.svc.buy(player, 'b1', 'pack-shop', 1)                                 // -100 -> 150
   await r.svc.buy(player, 'b2', 'pack-shop', 1)                                 // -100 -> 50
   await hook.wavedash(receipt(signer, { purchaseId: 'c1', event: 'purchase.refunded' }))
-  assert.equal((await r.svc.state(player)).coins, -200)
+  const after = await r.svc.state(player)
+  assert.equal(after.coins, 0)           // the 50 left are taken
+  assert.deepEqual(after.packs, [])      // the 200 spent come back as the two packs they bought
   await storeCode(r.svc.buy(player, 'b3', 'pack-shop', 1), 'insufficient_funds')
 })
 

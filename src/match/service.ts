@@ -214,7 +214,10 @@ export class MatchService implements RelayExtension {
     const pid = me.player_id
     switch (m.t) {
       case 'eco_get': return this.send(conn, { t: 'eco_state', ...echo, ...(await eco.state(pid)) })
-      case 'eco_products': return this.send(conn, { t: 'eco_products', ...echo, products: await eco.products() })
+      case 'eco_products': {
+        const until = await eco.purchaseBlockedUntil(pid)
+        return this.send(conn, { t: 'eco_products', ...echo, products: await eco.products(pid), ...(until !== null ? { blocked_until: until } : {}) })
+      }
       case 'eco_reward': {
         const r = await eco.reward(pid, m.reward_id)
         this.send(conn, { t: 'eco_reward', ...echo, reward_id: m.reward_id, granted: r.result.granted, coins: r.result.coins, applied: r.applied })
